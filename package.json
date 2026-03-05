@@ -1,0 +1,21 @@
+{
+  "name": "products_pipeline",
+  "version": "1.0.0",
+  "description": "Product-level Shopify sessions pipeline using ShopifyQL and MySQL snapshots",
+  "main": "pipeline.js",
+  "type": "module",
+  "scripts": {
+    "start": "node pipeline.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "cron": "^4.4.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "mysql2": "^3.9.7",
+    "node-cron": "^3.0.3",
+    "p-limit": "^7.2.0"
+  }
+}
