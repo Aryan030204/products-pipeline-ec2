@@ -1,0 +1,5 @@
+node_modules
+venv
+.git
+.env
+npm-debug.log

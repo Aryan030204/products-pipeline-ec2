@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+
+  products-pipeline:
+
+    build: .
+
+    container_name: products-pipeline
+
+    restart: always
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+
+    command: node pipeline.js
