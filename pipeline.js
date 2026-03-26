@@ -11,6 +11,10 @@
  *
  * Optional:
  *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (default)
+ *
+ * Hourly product sessions (full dimensions):
+ *   HOURLY_PRODUCT_SESSIONS_ENABLED=true
+ *   HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED=true   (only if you want this to run in BACKFILL_MODE)
  */
 
 import "dotenv/config";
@@ -75,6 +79,38 @@ const BACKFILL_END_IST_DATE = (
 ).split("T")[0]; // YYYY-MM-DD
 const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 const TEST_MODE = process.env.TEST_MODE === "true";
+const BACKFILL_BRAND_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.BACKFILL_BRAND_CONCURRENCY || "2", 10) || 2,
+);
+const HOURLY_PRODUCT_SESSIONS_ENABLED =
+  String(process.env.HOURLY_PRODUCT_SESSIONS_ENABLED || "").toLowerCase().trim() === "true";
+const HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED =
+  String(process.env.HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED || "").toLowerCase().trim() === "true";
+const HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS =
+  parseInt(process.env.HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS || "7", 10);
+
+// ---------- Concurrency helper ----------
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = nextIndex;
+      nextIndex += 1;
+      if (idx >= items.length) return;
+      results[idx] = await mapper(items[idx], idx);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 // ---------- Date-range helpers (safe iteration using UTC) ----------
 function isValidYMD(s) {
@@ -324,6 +360,16 @@ async function getBrands() {
   return _BRANDS;
 }
 
+async function ensureIndex(conn, tableName, indexName, addIndexSql) {
+  const [rows] = await conn.query(`SHOW INDEX FROM ?? WHERE Key_name = ?`, [
+    tableName,
+    indexName,
+  ]);
+  if (!rows.length) {
+    await conn.query(addIndexSql);
+  }
+}
+
 // ---------- DB Setup ----------
 async function ensureTablesForBrand(brand) {
   if (brand._tablesEnsured) return;
@@ -507,6 +553,64 @@ async function ensureTablesForBrand(brand) {
         KEY idx_date (date)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // Hourly product sessions with full dimensions (feature-flagged ingestion)
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS hourly_product_sessions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        date DATE NOT NULL,
+        hour TINYINT UNSIGNED NOT NULL,
+        landing_page_type VARCHAR(100) DEFAULT NULL,
+        landing_page_path VARCHAR(500) NOT NULL,
+        product_id VARCHAR(50) DEFAULT NULL,
+        product_title VARCHAR(255) DEFAULT NULL,
+        utm_source VARCHAR(255) DEFAULT NULL,
+        utm_medium VARCHAR(255) DEFAULT NULL,
+        utm_campaign VARCHAR(255) DEFAULT NULL,
+        utm_content VARCHAR(255) DEFAULT NULL,
+        utm_term VARCHAR(255) DEFAULT NULL,
+        referrer_name VARCHAR(255) DEFAULT NULL,
+        sessions INT NOT NULL DEFAULT 0,
+        sessions_with_cart_additions INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_date_hour (date, hour),
+        KEY idx_product_date (product_id, date),
+        KEY idx_date_campaign (date, utm_campaign(150)),
+        KEY idx_date_path (date, landing_page_path(200))
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS hourly_product_performance_rollup (
+        date DATE NOT NULL,
+        hour TINYINT UNSIGNED NOT NULL,
+        product_id VARCHAR(50) NOT NULL,
+        product_title VARCHAR(255) DEFAULT NULL,
+        sessions INT UNSIGNED NOT NULL DEFAULT 0,
+        sessions_with_cart_additions INT UNSIGNED NOT NULL DEFAULT 0,
+        orders INT UNSIGNED NOT NULL DEFAULT 0,
+        units_sold INT UNSIGNED NOT NULL DEFAULT 0,
+        total_sales DECIMAL(14,2) NOT NULL DEFAULT 0.00,
+        add_to_cart_rate DECIMAL(8,4) NOT NULL DEFAULT 0.0000,
+        cvr DECIMAL(8,4) NOT NULL DEFAULT 0.0000,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (date, hour, product_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await ensureIndex(
+      conn,
+      "hourly_product_performance_rollup",
+      "idx_hpr_product_date_hour",
+      "ALTER TABLE hourly_product_performance_rollup ADD INDEX idx_hpr_product_date_hour (product_id, date, hour)",
+    );
+    await ensureIndex(
+      conn,
+      "hourly_product_performance_rollup",
+      "idx_hpr_date_product",
+      "ALTER TABLE hourly_product_performance_rollup ADD INDEX idx_hpr_date_product (date, product_id)",
+    );
 
     brand._tablesEnsured = true;
   } finally {
@@ -705,7 +809,7 @@ function buildShopifyQLQuery(targetYmd = null) {
 }
 
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
-  const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
+  const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
   const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
@@ -771,7 +875,7 @@ function buildShopifyQLHourlyQuery(targetYmd = null) {
 }
 
 async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
-  const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
+  const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
   const q = buildShopifyQLHourlyQuery(targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
@@ -804,6 +908,386 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
 
     return formatShopifyQLTable(res.tableData);
   }
+}
+
+// ---------- Hourly Dimension ShopifyQL (per-hour time slices with full dimensions) ----------
+function buildHourClause(targetYmd, hour) {
+  const hh = String(hour).padStart(2, "0");
+  return `SINCE ${targetYmd}T${hh}:00:00 UNTIL ${targetYmd}T${hh}:59:59`;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function getThrottleResetSleepMsFromGraphQLErrors(errors) {
+  if (!Array.isArray(errors) || !errors.length) return null;
+
+  const throttled = errors.find(
+    (e) => e?.extensions?.code === "THROTTLED" && e?.extensions?.cost?.windowResetAt,
+  );
+  if (!throttled) return null;
+
+  const resetAt = Date.parse(throttled.extensions.cost.windowResetAt);
+  if (!Number.isFinite(resetAt)) return null;
+
+  // Add a small buffer so we don't wake up exactly on the boundary.
+  return Math.max(0, resetAt - Date.now()) + 250;
+}
+
+function buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd) {
+  const dayClause = buildDayClause(targetYmd);
+  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+
+  return `
+    FROM sessions
+      SHOW
+        hour_of_day,
+        landing_page_type,
+        landing_page_path,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_term,
+        referrer_name,
+        sessions,
+        sessions_with_cart_additions
+      WHERE landing_page_path IS NOT NULL
+        AND human_or_bot_session IN ('human', 'bot')
+      GROUP BY
+        hour_of_day,
+        landing_page_type,
+        landing_page_path,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_term,
+        referrer_name
+      ${tzClause}
+      ${dayClause}
+      ORDER BY sessions DESC
+      LIMIT 1000
+    VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
+  `.replace(/\n+/g, " ");
+}
+
+function buildShopifyQLHourlyDimensionQuery(targetYmd, hour) {
+  const hourClause = buildHourClause(targetYmd, hour);
+  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+
+  return `
+    FROM sessions
+      SHOW
+        landing_page_type,
+        landing_page_path,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_term,
+        referrer_name,
+        sessions,
+        sessions_with_cart_additions
+      WHERE landing_page_path IS NOT NULL
+        AND human_or_bot_session IN ('human', 'bot')
+      GROUP BY
+        landing_page_type,
+        landing_page_path,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_term,
+        referrer_name
+      ${tzClause}
+      ${hourClause}
+      ORDER BY sessions DESC
+      LIMIT 1000
+    VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
+  `.replace(/\n+/g, " ");
+}
+
+async function fetchHourlyDimensionSessions(brand, targetYmd) {
+  const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
+  const allRows = [];
+  const hourRowCounts = new Map();
+  const hourTruncated = new Set();
+  const hoursSucceeded = new Set();
+  const hoursSkipped = new Set();
+
+  const MAX_RETRIES = Math.max(
+    1,
+    parseInt(process.env.SHOPIFYQL_HOURLY_DIM_MAX_RETRIES || "5", 10) || 5,
+  );
+
+  // Fast path: try a single query that includes hour_of_day in the GROUP BY.
+  // If it returns < LIMIT rows, we can use it and avoid 24 separate hour slices.
+  try {
+    const qAll = buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd).replace(
+      /"/g,
+      '\\"',
+    );
+    const graphqlAll = {
+      query: `query { shopifyqlQuery(query: "${qAll}") { tableData { rows columns { name } } parseErrors } }`,
+    };
+
+    let attempt = 1;
+    while (attempt <= MAX_RETRIES) {
+      const resp = await axios.post(url, graphqlAll, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": brand.accessToken,
+        },
+        timeout: 60000,
+        validateStatus: () => true,
+      });
+
+      if (resp.status === 429) {
+        const retry = Number(resp.headers["retry-after"] || "3");
+        console.log(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) rate-limited (429), sleeping ${retry}s (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(retry * 1000);
+        continue;
+      }
+
+      if (resp.status >= 500) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) got ${resp.status}, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (resp.status !== 200) {
+        console.error(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) failed: HTTP ${resp.status} (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        break;
+      }
+
+      if (resp.data?.errors?.length) {
+        const throttleSleepMs = getThrottleResetSleepMsFromGraphQLErrors(
+          resp.data.errors,
+        );
+        if (throttleSleepMs != null) {
+          console.warn(
+            `[${brand.tag}] ShopifyQL hourly-dim(all) THROTTLED, sleeping ${Math.ceil(throttleSleepMs / 1000)}s until window reset (attempt ${attempt}/${MAX_RETRIES})`,
+          );
+          await sleep(throttleSleepMs);
+          // Don't burn an attempt if Shopify told us exactly when to retry.
+          continue;
+        }
+
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) GraphQL errors (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(resp.data.errors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      const res = resp.data.data?.shopifyqlQuery;
+      if (!res) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) missing shopifyqlQuery payload (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (res.parseErrors?.length) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim(all) parseErrors, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(res.parseErrors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      const rows = formatShopifyQLTable(res.tableData);
+      if (rows.length > 0 && rows.length < 1000) {
+        const normalized = [];
+        for (const row of rows) {
+          const h = Number(row.hour_of_day);
+          if (!Number.isFinite(h) || h < 0 || h > 23) continue;
+          normalized.push({ ...row, hour: h });
+        }
+
+        // Completeness note: single-query path only taken when < 1000 rows.
+        const byHour = new Map();
+        for (const r of normalized) byHour.set(Number(r.hour), (byHour.get(Number(r.hour)) || 0) + 1);
+        for (const [h, c] of byHour.entries()) {
+          hourRowCounts.set(h, c);
+          hoursSucceeded.add(h);
+        }
+        console.log(
+          `[${brand.tag}] Hourly dimension sessions fetched via single query: ${normalized.length} rows (no LIMIT truncation).`,
+        );
+        return normalized;
+      }
+
+      if (rows.length >= 1000) {
+        console.log(
+          `[${brand.tag}] Hourly dimension single-query hit LIMIT 1000; falling back to 24 hourly slices.`,
+        );
+      } else {
+        console.log(
+          `[${brand.tag}] Hourly dimension single-query returned ${rows.length} rows; falling back to 24 hourly slices.`,
+        );
+      }
+
+      break;
+    }
+  } catch (err) {
+    console.warn(
+      `[${brand.tag}] Hourly dimension single-query attempt failed; falling back to 24 hourly slices: ${err?.message}`,
+    );
+  }
+
+  for (let h = 0; h < 24; h++) {
+    const q = buildShopifyQLHourlyDimensionQuery(targetYmd, h).replace(/"/g, '\\"');
+    const graphql = {
+      query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
+    };
+
+    let succeeded = false;
+    let attempt = 1;
+    while (attempt <= MAX_RETRIES) {
+      const resp = await axios.post(url, graphql, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": brand.accessToken,
+        },
+        timeout: 60000,
+        validateStatus: () => true,
+      });
+
+      if (resp.status === 429) {
+        const retry = Number(resp.headers["retry-after"] || "3");
+        console.log(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} rate-limited (429), sleeping ${retry}s (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(retry * 1000);
+        continue;
+      }
+
+      if (resp.status >= 500) {
+        const sleepMs = Math.min(3000, 300 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} got ${resp.status}, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (resp.status !== 200) {
+        console.error(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} failed: HTTP ${resp.status} (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        break;
+      }
+
+      if (resp.data?.errors?.length) {
+        const throttleSleepMs = getThrottleResetSleepMsFromGraphQLErrors(
+          resp.data.errors,
+        );
+        if (throttleSleepMs != null) {
+          console.warn(
+            `[${brand.tag}] ShopifyQL hourly-dim h=${h} THROTTLED, sleeping ${Math.ceil(throttleSleepMs / 1000)}s until window reset (attempt ${attempt}/${MAX_RETRIES})`,
+          );
+          await sleep(throttleSleepMs);
+          // Don't burn an attempt if Shopify told us exactly when to retry.
+          continue;
+        }
+
+        const sleepMs = Math.min(3000, 300 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} GraphQL errors (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(resp.data.errors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      const res = resp.data.data?.shopifyqlQuery;
+      if (!res) {
+        const sleepMs = Math.min(3000, 300 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} missing shopifyqlQuery payload (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (res.parseErrors?.length) {
+        const sleepMs = Math.min(3000, 300 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} parseErrors, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(res.parseErrors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      const rows = formatShopifyQLTable(res.tableData);
+      for (const row of rows) row.hour = h;
+      allRows.push(...rows);
+      hourRowCounts.set(h, rows.length);
+      hoursSucceeded.add(h);
+      if (rows.length >= 1000) {
+        hourTruncated.add(h);
+        console.warn(
+          `[${brand.tag}] ShopifyQL hourly-dim h=${h} returned ${rows.length} rows (LIMIT 1000). This hour may be truncated.`,
+        );
+      }
+      succeeded = true;
+      break;
+    }
+
+    if (!succeeded) {
+      console.error(
+        `[${brand.tag}] ShopifyQL hourly-dim h=${h} failed after ${MAX_RETRIES} attempts; skipping this hour slice.`,
+      );
+      hoursSkipped.add(h);
+    }
+
+    // Small delay between calls to be respectful to rate limits
+    if (h < 23) await sleep(200);
+  }
+
+  const succeededCount = hoursSucceeded.size;
+  const skippedCount = hoursSkipped.size;
+  const truncatedCount = hourTruncated.size;
+
+  console.log(
+    `[${brand.tag}] Hourly dimension sessions fetched: ${allRows.length} total rows (hours_succeeded=${succeededCount}/24, hours_skipped=${skippedCount}).`,
+  );
+  if (skippedCount > 0) {
+    console.warn(
+      `[${brand.tag}] Hourly dimension fetch was PARTIAL for ${targetYmd}. Skipped hours: ${Array.from(hoursSkipped)
+        .sort((a, b) => a - b)
+        .join(", ")}`,
+    );
+  }
+  if (truncatedCount > 0) {
+    console.warn(
+      `[${brand.tag}] Hourly dimension fetch may be TRUNCATED for ${targetYmd}. Hours with 1000-row slices: ${Array.from(hourTruncated)
+        .sort((a, b) => a - b)
+        .join(", ")}`,
+    );
+  }
+  return allRows;
 }
 
 // ---------- Snapshot + MV refresh ----------
@@ -1129,6 +1613,211 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
   }
 }
 
+// ---------- Hourly product sessions upsert (full dimensions) ----------
+async function upsertHourlyProductSessions(brand, rows, targetYmd) {
+  const conn = await brand.pool.getConnection();
+  try {
+    await conn.query(`DELETE FROM hourly_product_sessions WHERE date = ?`, [
+      targetYmd,
+    ]);
+    if (!rows.length) {
+      console.log(
+        `[${brand.name}] No hourly product session rows for ${targetYmd}.`,
+      );
+      return;
+    }
+
+    // Batch insert in chunks of 500 to avoid packet size issues
+    const CHUNK = 500;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      const insertRows = chunk.map((r) => [
+        targetYmd,
+        Number(r.hour),
+        r.landing_page_type || "Unknown",
+        r.landing_page_path || null,
+        null, // product_id — populated by JOIN below
+        null, // product_title — populated by JOIN below
+        r.utm_source || null,
+        r.utm_medium || null,
+        r.utm_campaign || null,
+        r.utm_content || null,
+        r.utm_term || null,
+        r.referrer_name || null,
+        Number(r.sessions || 0),
+        Number(r.sessions_with_cart_additions || 0),
+        new Date(),
+      ]);
+
+      const placeholders = insertRows
+        .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .join(", ");
+
+      await conn.query(
+        `
+        INSERT INTO hourly_product_sessions
+        (
+          date, hour, landing_page_type, landing_page_path,
+          product_id, product_title,
+          utm_source, utm_medium, utm_campaign, utm_content, utm_term,
+          referrer_name, sessions, sessions_with_cart_additions, created_at
+        )
+        VALUES ${placeholders}
+        `,
+        insertRows.flat(),
+      );
+    }
+
+    // Backfill product_id + product_title from product_landing_mapping
+    await conn.query(
+      `
+      UPDATE hourly_product_sessions h
+      JOIN product_landing_mapping m
+        ON (
+          CASE WHEN h.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM h.landing_page_path) END
+        ) = (
+          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
+        )
+      SET h.product_id = m.product_id,
+          h.product_title = m.title
+      WHERE h.date = ?
+        AND (h.product_id IS NULL OR h.product_title IS NULL)
+        AND (m.product_id IS NOT NULL OR m.title IS NOT NULL)
+      `,
+      [targetYmd],
+    );
+
+    console.log(
+      `[${brand.name}] Inserted ${rows.length} hourly product session rows for ${targetYmd}.`,
+    );
+  } finally {
+    conn.release();
+  }
+}
+
+async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
+  const conn = await brand.pool.getConnection();
+  try {
+    await conn.query(
+      `DELETE FROM hourly_product_performance_rollup WHERE date = ?`,
+      [targetYmd],
+    );
+
+    const [result] = await conn.query(
+      `
+      INSERT INTO hourly_product_performance_rollup
+      (
+        date,
+        hour,
+        product_id,
+        product_title,
+        sessions,
+        sessions_with_cart_additions,
+        orders,
+        units_sold,
+        total_sales,
+        add_to_cart_rate,
+        cvr
+      )
+      SELECT
+        k.date,
+        k.hour,
+        k.product_id,
+        COALESCE(s.product_title, o.product_title, 'Unknown') AS product_title,
+        COALESCE(s.sessions, 0) AS sessions,
+        COALESCE(s.sessions_with_cart_additions, 0) AS sessions_with_cart_additions,
+        COALESCE(o.orders, 0) AS orders,
+        COALESCE(o.units_sold, 0) AS units_sold,
+        COALESCE(o.total_sales, 0.00) AS total_sales,
+        ROUND(
+          COALESCE(s.sessions_with_cart_additions, 0) / NULLIF(COALESCE(s.sessions, 0), 0),
+          4
+        ) AS add_to_cart_rate,
+        ROUND(
+          COALESCE(o.orders, 0) / NULLIF(COALESCE(s.sessions, 0), 0),
+          4
+        ) AS cvr
+      FROM (
+        SELECT date, hour, product_id
+        FROM (
+          SELECT
+            h.date,
+            h.hour,
+            h.product_id
+          FROM hourly_product_sessions h
+          WHERE h.date = ?
+            AND h.product_id IS NOT NULL
+            AND h.product_id <> ''
+          GROUP BY h.date, h.hour, h.product_id
+
+          UNION
+
+          SELECT
+            o.created_dt AS date,
+            o.created_hr AS hour,
+            o.product_id
+          FROM shopify_orders o
+          WHERE o.created_dt = ?
+            AND o.order_id IS NOT NULL
+            AND o.product_id IS NOT NULL
+            AND o.product_id <> ''
+          GROUP BY o.created_dt, o.created_hr, o.product_id
+        ) keys_union
+      ) k
+      LEFT JOIN (
+        SELECT
+          h.date,
+          h.hour,
+          h.product_id,
+          MAX(h.product_title) AS product_title,
+          SUM(h.sessions) AS sessions,
+          SUM(h.sessions_with_cart_additions) AS sessions_with_cart_additions
+        FROM hourly_product_sessions h
+        WHERE h.date = ?
+          AND h.product_id IS NOT NULL
+          AND h.product_id <> ''
+        GROUP BY h.date, h.hour, h.product_id
+      ) s
+        ON s.date = k.date
+       AND s.hour = k.hour
+       AND s.product_id = k.product_id
+      LEFT JOIN (
+        SELECT
+          o.created_dt AS date,
+          o.created_hr AS hour,
+          o.product_id,
+          MAX(o.line_item) AS product_title,
+          COUNT(DISTINCT o.order_id) AS orders,
+          SUM(GREATEST(COALESCE(o.line_item_quantity, 0), 0)) AS units_sold,
+          ROUND(
+            SUM(
+              (COALESCE(o.line_item_price, 0) * GREATEST(COALESCE(o.line_item_quantity, 0), 0))
+              - COALESCE(o.line_item_total_discount, 0)
+            ),
+            2
+          ) AS total_sales
+        FROM shopify_orders o
+        WHERE o.created_dt = ?
+          AND o.order_id IS NOT NULL
+          AND o.product_id IS NOT NULL
+          AND o.product_id <> ''
+        GROUP BY o.created_dt, o.created_hr, o.product_id
+      ) o
+        ON o.date = k.date
+       AND o.hour = k.hour
+       AND o.product_id = k.product_id
+      `,
+      [targetYmd, targetYmd, targetYmd, targetYmd],
+    );
+
+    console.log(
+      `[${brand.name}] Product performance rollup refreshed for ${targetYmd}. Rows: ${result.affectedRows || 0}`,
+    );
+  } finally {
+    conn.release();
+  }
+}
+
 // ---------- Pipeline per brand (date-aware) ----------
 async function processBrand(brand, targetYmd) {
   const startTotal = Date.now();
@@ -1158,6 +1847,16 @@ async function processBrand(brand, targetYmd) {
   const hourly = await fetchShopifyQLHourlySessions(brand, targetYmd);
   await upsertHourlySessionsSummary(brand, hourly, targetYmd);
 
+  // Hourly product sessions with full dimensions (feature-flagged)
+  if (
+    HOURLY_PRODUCT_SESSIONS_ENABLED &&
+    (!BACKFILL_MODE || HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED)
+  ) {
+    const hourlyDim = await fetchHourlyDimensionSessions(brand, targetYmd);
+    await upsertHourlyProductSessions(brand, hourlyDim, targetYmd);
+    await upsertHourlyProductPerformanceRollup(brand, targetYmd);
+  }
+
   console.log(
     `[${brand.tag}] Pipeline complete for ${targetYmd}. Duration: ${(Date.now() - startTotal) / 1000}s`,
   );
@@ -1184,7 +1883,7 @@ async function runBackfillPipeline() {
     BACKFILL_START_IST_DATE,
     BACKFILL_END_IST_DATE,
   );
-  const brands = getBrands();
+  const brands = await getBrands();
 
   console.log(`\n🧱 Backfill mode enabled @ ${fmtIST()}`);
   console.log(
@@ -1193,7 +1892,16 @@ async function runBackfillPipeline() {
 
   for (const d of dates) {
     console.log(`\n🗓️ [BACKFILL] Running for ${d} ...\n`);
-    await Promise.all(brands.map((b) => processBrand(b, d)));
+    if (brands.length <= 1 || BACKFILL_BRAND_CONCURRENCY >= brands.length) {
+      await Promise.all(brands.map((b) => processBrand(b, d)));
+    } else {
+      console.log(
+        `[BACKFILL] Brand concurrency limit: ${BACKFILL_BRAND_CONCURRENCY} (brands=${brands.length})`,
+      );
+      await mapWithConcurrency(brands, BACKFILL_BRAND_CONCURRENCY, (b) =>
+        processBrand(b, d),
+      );
+    }
   }
 
   console.log(`\n🏁 Backfill complete for ${dates.length} days.\n`);

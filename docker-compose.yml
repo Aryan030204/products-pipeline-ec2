@@ -6,7 +6,7 @@ services:
 
     build: .
 
-    container_name: products-pipeline
+    container_name: products-pipeline-ec2
 
     restart: always
 
