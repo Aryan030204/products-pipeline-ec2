@@ -1948,18 +1948,31 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     console.log(`[SCHED] Backfill mode is ON; cron is disabled.`);
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   } else {
-    // 1) Run immediately on deployment/startup
-    safeRun("startup");
+    // 1) Optionally run immediately on deployment/startup.
+    //    Default: off — we follow a fixed schedule to avoid colliding with
+    //    the other pipeline that runs at minutes 0, 10, 20, ... and draining
+    //    RDS EBSByteBalance%. Set RUN_ON_BOOT=true to force an initial run.
+    const RUN_ON_BOOT =
+      String(process.env.RUN_ON_BOOT || "").toLowerCase().trim() === "true";
 
-    // 2) Cron: run at the start of each hour (minute 0, second 0) in Asia/Kolkata
+    if (RUN_ON_BOOT) {
+      safeRun("startup");
+    } else {
+      console.log(
+        `[SCHED] RUN_ON_BOOT is off; waiting for next scheduled tick.`,
+      );
+    }
+
+    // 2) Cron: run at minute 5 of every hour (Asia/Kolkata) so we don't
+    //    collide with the other pipeline's 0/10/20/... schedule.
     cron.schedule(
-      "0 0 * * * *", // second minute hour day month weekday
+      "0 5 * * * *", // second minute hour day month weekday
       () => safeRun("hourly"),
       { timezone: "Asia/Kolkata" },
     );
 
     console.log(
-      `[SCHED] Cron enabled: runs at start of every hour (Asia/Kolkata).`,
+      `[SCHED] Cron enabled: runs at minute 5 of every hour (Asia/Kolkata).`,
     );
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   }
