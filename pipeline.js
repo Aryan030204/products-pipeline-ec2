@@ -93,6 +93,8 @@ const HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED =
   String(process.env.HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED || "").toLowerCase().trim() === "true";
 const HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS =
   parseInt(process.env.HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS || "7", 10);
+const SELF_RUN =
+  String(process.env.SELF_RUN || "true").toLowerCase().trim() === "true";
 
 // ---------- Concurrency helper ----------
 async function mapWithConcurrency(items, concurrency, mapper) {
@@ -2131,15 +2133,21 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 
     // 2) Cron: run at minute 5 of every hour (Asia/Kolkata) so we don't
     //    collide with the other pipeline's 0/10/20/... schedule.
-    cron.schedule(
-      "0 5 * * * *", // second minute hour day month weekday
-      () => safeRun("hourly"),
-      { timezone: "Asia/Kolkata" },
-    );
+    if (SELF_RUN) {
+      cron.schedule(
+        "0 5 * * * *", // second minute hour day month weekday
+        () => safeRun("hourly"),
+        { timezone: "Asia/Kolkata" },
+      );
 
-    console.log(
-      `[SCHED] Cron enabled: runs at minute 5 of every hour (Asia/Kolkata).`,
-    );
+      console.log(
+        `[SCHED] Cron enabled: runs at minute 5 of every hour (Asia/Kolkata).`,
+      );
+    } else {
+      console.log(
+        `[SCHED] SELF_RUN is false; automatic hourly schedule disabled.`,
+      );
+    }
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   }
 
@@ -2147,16 +2155,31 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const app = express();
   const PORT = process.env.PORT || 8080;
 
-  app.post("/run-pipeline", (req, res) => {
-    console.log(`[SERVER] /run-pipeline triggered manually.`);
-    console.log(`[SERVER] Request IP: ${req.ip}`);
+  // Authenticated manual trigger
+  app.post("/trigger", (req, res) => {
+    const authKey = req.headers["x-pipeline-key"];
+    if (authKey !== PIPELINE_AUTH_HEADER) {
+      console.warn(`[SERVER] Unauthorized /trigger attempt from IP: ${req.ip}`);
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
-    safeRun("manual_http"); // Fire and forget or wait? safeRun handles concurrency.
+    console.log(`[SERVER] /trigger triggered manually.`);
+    safeRun("manual_http");
     res.json({
       status: "triggered",
       message: "Pipeline trigger received. Check logs for progress.",
       timestamp: fmtIST(),
     });
+  });
+
+  // Legacy endpoint (now authenticated)
+  app.post("/run-pipeline", (req, res) => {
+    const authKey = req.headers["x-pipeline-key"];
+    if (authKey !== PIPELINE_AUTH_HEADER) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    safeRun("manual_http");
+    res.json({ status: "triggered", timestamp: fmtIST() });
   });
 
   app.listen(PORT, () => {
