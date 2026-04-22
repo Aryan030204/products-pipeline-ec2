@@ -83,6 +83,10 @@ const BACKFILL_BRAND_CONCURRENCY = Math.max(
   1,
   parseInt(process.env.BACKFILL_BRAND_CONCURRENCY || "2", 10) || 2,
 );
+const HOURLY_BRAND_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.HOURLY_BRAND_CONCURRENCY || "2", 10) || 2,
+);
 const HOURLY_PRODUCT_SESSIONS_ENABLED =
   String(process.env.HOURLY_PRODUCT_SESSIONS_ENABLED || "").toLowerCase().trim() === "true";
 const HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED =
@@ -370,6 +374,32 @@ async function ensureIndex(conn, tableName, indexName, addIndexSql) {
   }
 }
 
+async function ensureColumn(conn, tableName, columnName, addColumnSql) {
+  const [rows] = await conn.query(`SHOW COLUMNS FROM ?? LIKE ?`, [
+    tableName,
+    columnName,
+  ]);
+  if (!rows.length) {
+    await conn.query(addColumnSql);
+  }
+}
+
+// Stored hash of the dimension tuple — must stay in lock-step across
+// product_sessions_snapshot and hourly_product_sessions so identical tuples
+// produce identical hashes.
+const DIM_HASH_EXPR = `UNHEX(SHA1(CONCAT_WS('|',
+  landing_page_type,
+  landing_page_path,
+  IFNULL(utm_source,''),
+  IFNULL(utm_medium,''),
+  IFNULL(utm_campaign,''),
+  IFNULL(utm_content,''),
+  IFNULL(utm_term,''),
+  IFNULL(referrer_name,'')
+)))`;
+
+const PATH_NORM_EXPR = `IF(landing_page_path='/', '/', TRIM(TRAILING '/' FROM landing_page_path))`;
+
 // ---------- DB Setup ----------
 async function ensureTablesForBrand(brand) {
   if (brand._tablesEnsured) return;
@@ -395,15 +425,64 @@ async function ensureTablesForBrand(brand) {
         sessions INT DEFAULT 0,
         sessions_with_cart_additions INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        landing_page_path_norm VARCHAR(500) GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED,
+        dim_hash BINARY(20) GENERATED ALWAYS AS (${DIM_HASH_EXPR}) STORED,
         PRIMARY KEY (id),
+        UNIQUE KEY uniq_date_dim (date, dim_hash),
         KEY idx_date (date),
-        KEY idx_date_path (date, landing_page_path(200)),
-        KEY idx_page_path (landing_page_path(200)),
-        KEY idx_date_campaign (date, utm_campaign(100)),
-        KEY idx_date_referrer (date, referrer_name(100)),
+        KEY idx_date_norm (date, landing_page_path_norm(200)),
+        KEY idx_date_updated (date, updated_at),
         KEY idx_product_id (product_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // Provision the new upsert-path columns + indexes for existing tables
+    // that predate this schema. All idempotent.
+    await ensureColumn(
+      conn,
+      "product_sessions_snapshot",
+      "updated_at",
+      `ALTER TABLE product_sessions_snapshot
+         ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
+    );
+    await ensureColumn(
+      conn,
+      "product_sessions_snapshot",
+      "landing_page_path_norm",
+      `ALTER TABLE product_sessions_snapshot
+         ADD COLUMN landing_page_path_norm VARCHAR(500)
+           GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED`,
+    );
+    await ensureColumn(
+      conn,
+      "product_sessions_snapshot",
+      "dim_hash",
+      `ALTER TABLE product_sessions_snapshot
+         ADD COLUMN dim_hash BINARY(20)
+           GENERATED ALWAYS AS (${DIM_HASH_EXPR}) STORED`,
+    );
+    await ensureIndex(
+      conn,
+      "product_sessions_snapshot",
+      "uniq_date_dim",
+      `ALTER TABLE product_sessions_snapshot
+         ADD UNIQUE KEY uniq_date_dim (date, dim_hash)`,
+    );
+    await ensureIndex(
+      conn,
+      "product_sessions_snapshot",
+      "idx_date_norm",
+      `ALTER TABLE product_sessions_snapshot
+         ADD KEY idx_date_norm (date, landing_page_path_norm(200))`,
+    );
+    await ensureIndex(
+      conn,
+      "product_sessions_snapshot",
+      "idx_date_updated",
+      `ALTER TABLE product_sessions_snapshot
+         ADD KEY idx_date_updated (date, updated_at)`,
+    );
 
     const [snapshotCols] = await conn.query(
       `SHOW COLUMNS FROM product_sessions_snapshot LIKE 'product_id'`,
@@ -494,8 +573,10 @@ async function ensureTablesForBrand(brand) {
         status VARCHAR(50) DEFAULT NULL,
         title VARCHAR(255) DEFAULT NULL,
         last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        landing_page_path_norm VARCHAR(500) GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED,
         PRIMARY KEY (id),
         UNIQUE KEY uniq_landing_page_path (landing_page_path(200)),
+        UNIQUE KEY uniq_landing_page_path_norm (landing_page_path_norm(200)),
         KEY idx_product_id (product_id),
         KEY idx_last_synced_at (last_synced_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -513,6 +594,22 @@ async function ensureTablesForBrand(brand) {
         `ALTER TABLE product_landing_mapping ADD COLUMN product_type VARCHAR(255) NULL AFTER title`,
       );
     }
+
+    await ensureColumn(
+      conn,
+      "product_landing_mapping",
+      "landing_page_path_norm",
+      `ALTER TABLE product_landing_mapping
+         ADD COLUMN landing_page_path_norm VARCHAR(500)
+           GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED`,
+    );
+    await ensureIndex(
+      conn,
+      "product_landing_mapping",
+      "uniq_landing_page_path_norm",
+      `ALTER TABLE product_landing_mapping
+         ADD UNIQUE KEY uniq_landing_page_path_norm (landing_page_path_norm(200))`,
+    );
 
     // Note: includes landing_page_path because your INSERT uses it
     await conn.query(`
@@ -573,13 +670,62 @@ async function ensureTablesForBrand(brand) {
         sessions INT NOT NULL DEFAULT 0,
         sessions_with_cart_additions INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        landing_page_path_norm VARCHAR(500) GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED,
+        dim_hash BINARY(20) GENERATED ALWAYS AS (${DIM_HASH_EXPR}) STORED,
         PRIMARY KEY (id),
+        UNIQUE KEY uniq_date_hour_dim (date, hour, dim_hash),
         KEY idx_date_hour (date, hour),
-        KEY idx_product_date (product_id, date),
-        KEY idx_date_campaign (date, utm_campaign(150)),
-        KEY idx_date_path (date, landing_page_path(200))
+        KEY idx_date_norm (date, landing_page_path_norm(200)),
+        KEY idx_date_updated (date, updated_at),
+        KEY idx_product_date (product_id, date)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    await ensureColumn(
+      conn,
+      "hourly_product_sessions",
+      "updated_at",
+      `ALTER TABLE hourly_product_sessions
+         ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
+    );
+    await ensureColumn(
+      conn,
+      "hourly_product_sessions",
+      "landing_page_path_norm",
+      `ALTER TABLE hourly_product_sessions
+         ADD COLUMN landing_page_path_norm VARCHAR(500)
+           GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED`,
+    );
+    await ensureColumn(
+      conn,
+      "hourly_product_sessions",
+      "dim_hash",
+      `ALTER TABLE hourly_product_sessions
+         ADD COLUMN dim_hash BINARY(20)
+           GENERATED ALWAYS AS (${DIM_HASH_EXPR}) STORED`,
+    );
+    await ensureIndex(
+      conn,
+      "hourly_product_sessions",
+      "uniq_date_hour_dim",
+      `ALTER TABLE hourly_product_sessions
+         ADD UNIQUE KEY uniq_date_hour_dim (date, hour, dim_hash)`,
+    );
+    await ensureIndex(
+      conn,
+      "hourly_product_sessions",
+      "idx_date_norm",
+      `ALTER TABLE hourly_product_sessions
+         ADD KEY idx_date_norm (date, landing_page_path_norm(200))`,
+    );
+    await ensureIndex(
+      conn,
+      "hourly_product_sessions",
+      "idx_date_updated",
+      `ALTER TABLE hourly_product_sessions
+         ADD KEY idx_date_updated (date, updated_at)`,
+    );
 
     await conn.query(`
       CREATE TABLE IF NOT EXISTS hourly_product_performance_rollup (
@@ -1295,10 +1441,15 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
-    await conn.query(`DELETE FROM product_sessions_snapshot WHERE date=?`, [
-      targetYmd,
-    ]);
-    if (!rows.length) return;
+    if (!rows.length) {
+      console.log(`[${brand.name}] No snapshot rows for ${targetYmd}.`);
+      return;
+    }
+
+    // DB-side clock so the stale-sweep cutoff is immune to app/DB skew.
+    const [[{ run_started_at: runStartedAt }]] = await conn.query(
+      `SELECT NOW() AS run_started_at`,
+    );
 
     const insertRows = rows.map((r) => [
       targetYmd,
@@ -1313,11 +1464,10 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       r.referrer_name || null,
       Number(r.sessions || 0),
       Number(r.sessions_with_cart_additions || 0),
-      new Date(),
     ]);
 
     const placeholders = insertRows
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .join(", ");
 
     await conn.query(
@@ -1335,10 +1485,13 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
         utm_term,
         referrer_name,
         sessions,
-        sessions_with_cart_additions,
-        created_at
+        sessions_with_cart_additions
       )
       VALUES ${placeholders}
+      ON DUPLICATE KEY UPDATE
+        sessions                     = VALUES(sessions),
+        sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        updated_at                   = CURRENT_TIMESTAMP
     `,
       insertRows.flat(),
     );
@@ -1347,11 +1500,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       `
       UPDATE product_sessions_snapshot s
       JOIN product_landing_mapping m
-        ON (
-          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
-        ) = (
-          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
-        )
+        ON s.landing_page_path_norm = m.landing_page_path_norm
       SET s.product_id = m.product_id,
           s.product_title = m.title
       WHERE s.date = ?
@@ -1361,8 +1510,15 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       [targetYmd],
     );
 
+    // Sweep tuples that existed for this date but weren't present in this
+    // run (e.g. fell out of ShopifyQL's LIMIT 1000 window).
+    const [sweep] = await conn.query(
+      `DELETE FROM product_sessions_snapshot WHERE date = ? AND updated_at < ?`,
+      [targetYmd, runStartedAt],
+    );
+
     console.log(
-      `[${brand.name}] Inserted ${insertRows.length} rows into snapshot for ${targetYmd}.`,
+      `[${brand.name}] Upserted ${insertRows.length} snapshot rows for ${targetYmd}; swept ${sweep.affectedRows} stale.`,
     );
   } finally {
     conn.release();
@@ -1373,19 +1529,9 @@ async function refreshMaterializedViews(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
-    // Wipe target day's rows from all MVs
-    await conn.query(
-      `DELETE FROM mv_product_sessions_by_type_daily     WHERE date = ?`,
-      [targetYmd],
-    );
-    await conn.query(
-      `DELETE FROM mv_product_sessions_by_path_daily     WHERE date = ?`,
-      [targetYmd],
-    );
-    await conn.query(
-      `DELETE FROM mv_product_sessions_by_campaign_daily WHERE date = ?`,
-      [targetYmd],
-    );
+    // MVs are upserted directly via ON DUPLICATE KEY UPDATE — no prior DELETE
+    // needed. The PK of each MV matches the aggregation's GROUP BY, so a
+    // tuple that's already present just gets its counters overwritten.
 
     // ---------- TYPE MV ----------
     await conn.query(
@@ -1403,13 +1549,13 @@ async function refreshMaterializedViews(brand, targetYmd) {
              ELSE 0 END AS add_to_cart_rate
       FROM product_sessions_snapshot s
       LEFT JOIN product_landing_mapping m
-        ON (
-          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
-        ) = (
-          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
-        )
+        ON s.landing_page_path_norm = m.landing_page_path_norm
       WHERE s.date = ?
       GROUP BY s.date, s.landing_page_type, product_type
+      ON DUPLICATE KEY UPDATE
+        sessions                     = VALUES(sessions),
+        sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        add_to_cart_rate             = VALUES(add_to_cart_rate)
     `,
       [targetYmd],
     );
@@ -1457,11 +1603,7 @@ async function refreshMaterializedViews(brand, targetYmd) {
       FROM product_sessions_snapshot s
 
       LEFT JOIN product_landing_mapping m
-        ON (
-          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
-        ) = (
-          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
-        )
+        ON s.landing_page_path_norm = m.landing_page_path_norm
 
       LEFT JOIN (
         SELECT
@@ -1482,6 +1624,12 @@ async function refreshMaterializedViews(brand, targetYmd) {
         s.date,
         s.landing_page_path,
         m.product_id
+      ON DUPLICATE KEY UPDATE
+        sessions                     = VALUES(sessions),
+        sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        add_to_cart_rate             = VALUES(add_to_cart_rate),
+        add_to_cart_rate_pct         = VALUES(add_to_cart_rate_pct),
+        conversion_rate_pct          = VALUES(conversion_rate_pct)
     `,
       [targetYmd, targetYmd],
     );
@@ -1526,11 +1674,7 @@ async function refreshMaterializedViews(brand, targetYmd) {
       FROM product_sessions_snapshot s
 
       LEFT JOIN product_landing_mapping m
-        ON (
-          CASE WHEN s.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM s.landing_page_path) END
-        ) = (
-          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
-        )
+        ON s.landing_page_path_norm = m.landing_page_path_norm
 
       LEFT JOIN (
         SELECT
@@ -1555,12 +1699,17 @@ async function refreshMaterializedViews(brand, targetYmd) {
         utm_campaign,
         m.product_id,
         s.referrer_name
+      ON DUPLICATE KEY UPDATE
+        sessions                     = VALUES(sessions),
+        sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        add_to_cart_rate_pct         = VALUES(add_to_cart_rate_pct),
+        conversion_rate_pct          = VALUES(conversion_rate_pct)
     `,
       [targetYmd, targetYmd],
     );
 
     console.log(
-      `[${brand.name}] Refreshed MVs for ${targetYmd} (Deleted old, inserted new).`,
+      `[${brand.name}] Refreshed MVs for ${targetYmd} (upserted).`,
     );
   } catch (err) {
     console.error(`[${brand.name}] MV Refresh Error:`, err);
@@ -1574,11 +1723,6 @@ async function refreshMaterializedViews(brand, targetYmd) {
 async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
-    await conn.query(
-      `DELETE FROM hourly_sessions_summary_shopify WHERE date = ?`,
-      [targetYmd],
-    );
-
     const byHour = new Map();
     for (const r of hourlyRows) {
       const h = Number(r.hour_of_day);
@@ -1592,21 +1736,24 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
     const insertRows = [];
     for (let h = 0; h < 24; h++) {
       const v = byHour.get(h) || { sessions: 0, atc: 0 };
-      insertRows.push([targetYmd, h, v.sessions, v.atc, null]);
+      insertRows.push([targetYmd, h, v.sessions, v.atc]);
     }
 
-    const placeholders = insertRows.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    const placeholders = insertRows.map(() => "(?, ?, ?, ?)").join(", ");
     await conn.query(
       `
       INSERT INTO hourly_sessions_summary_shopify
-        (date, hour, number_of_sessions, number_of_atc_sessions, adjusted_number_of_sessions)
+        (date, hour, number_of_sessions, number_of_atc_sessions)
       VALUES ${placeholders}
+      ON DUPLICATE KEY UPDATE
+        number_of_sessions     = VALUES(number_of_sessions),
+        number_of_atc_sessions = VALUES(number_of_atc_sessions)
       `,
       insertRows.flat(),
     );
 
     console.log(
-      `[${brand.name}] Hourly sessions summary populated for ${targetYmd}`,
+      `[${brand.name}] Hourly sessions summary upserted for ${targetYmd}`,
     );
   } finally {
     conn.release();
@@ -1617,9 +1764,6 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
 async function upsertHourlyProductSessions(brand, rows, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
-    await conn.query(`DELETE FROM hourly_product_sessions WHERE date = ?`, [
-      targetYmd,
-    ]);
     if (!rows.length) {
       console.log(
         `[${brand.name}] No hourly product session rows for ${targetYmd}.`,
@@ -1627,7 +1771,11 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
       return;
     }
 
-    // Batch insert in chunks of 500 to avoid packet size issues
+    const [[{ run_started_at: runStartedAt }]] = await conn.query(
+      `SELECT NOW() AS run_started_at`,
+    );
+
+    // Batch upsert in chunks of 500 to avoid packet size issues.
     const CHUNK = 500;
     for (let i = 0; i < rows.length; i += CHUNK) {
       const chunk = rows.slice(i, i + CHUNK);
@@ -1636,8 +1784,6 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
         Number(r.hour),
         r.landing_page_type || "Unknown",
         r.landing_page_path || null,
-        null, // product_id — populated by JOIN below
-        null, // product_title — populated by JOIN below
         r.utm_source || null,
         r.utm_medium || null,
         r.utm_campaign || null,
@@ -1646,11 +1792,10 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
         r.referrer_name || null,
         Number(r.sessions || 0),
         Number(r.sessions_with_cart_additions || 0),
-        new Date(),
       ]);
 
       const placeholders = insertRows
-        .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .join(", ");
 
       await conn.query(
@@ -1658,11 +1803,14 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
         INSERT INTO hourly_product_sessions
         (
           date, hour, landing_page_type, landing_page_path,
-          product_id, product_title,
           utm_source, utm_medium, utm_campaign, utm_content, utm_term,
-          referrer_name, sessions, sessions_with_cart_additions, created_at
+          referrer_name, sessions, sessions_with_cart_additions
         )
         VALUES ${placeholders}
+        ON DUPLICATE KEY UPDATE
+          sessions                     = VALUES(sessions),
+          sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+          updated_at                   = CURRENT_TIMESTAMP
         `,
         insertRows.flat(),
       );
@@ -1673,11 +1821,7 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
       `
       UPDATE hourly_product_sessions h
       JOIN product_landing_mapping m
-        ON (
-          CASE WHEN h.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM h.landing_page_path) END
-        ) = (
-          CASE WHEN m.landing_page_path = '/' THEN '/' ELSE TRIM(TRAILING '/' FROM m.landing_page_path) END
-        )
+        ON h.landing_page_path_norm = m.landing_page_path_norm
       SET h.product_id = m.product_id,
           h.product_title = m.title
       WHERE h.date = ?
@@ -1687,8 +1831,14 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
       [targetYmd],
     );
 
+    // Sweep tuples that existed for this date but weren't present in this run.
+    const [sweep] = await conn.query(
+      `DELETE FROM hourly_product_sessions WHERE date = ? AND updated_at < ?`,
+      [targetYmd, runStartedAt],
+    );
+
     console.log(
-      `[${brand.name}] Inserted ${rows.length} hourly product session rows for ${targetYmd}.`,
+      `[${brand.name}] Upserted ${rows.length} hourly product session rows for ${targetYmd}; swept ${sweep.affectedRows} stale.`,
     );
   } finally {
     conn.release();
@@ -1698,9 +1848,8 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
 async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
-    await conn.query(
-      `DELETE FROM hourly_product_performance_rollup WHERE date = ?`,
-      [targetYmd],
+    const [[{ run_started_at: runStartedAt }]] = await conn.query(
+      `SELECT NOW() AS run_started_at`,
     );
 
     const [result] = await conn.query(
@@ -1806,12 +1955,27 @@ async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
         ON o.date = k.date
        AND o.hour = k.hour
        AND o.product_id = k.product_id
+      ON DUPLICATE KEY UPDATE
+        product_title                = VALUES(product_title),
+        sessions                     = VALUES(sessions),
+        sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        orders                       = VALUES(orders),
+        units_sold                   = VALUES(units_sold),
+        total_sales                  = VALUES(total_sales),
+        add_to_cart_rate             = VALUES(add_to_cart_rate),
+        cvr                          = VALUES(cvr),
+        updated_at                   = CURRENT_TIMESTAMP
       `,
       [targetYmd, targetYmd, targetYmd, targetYmd],
     );
 
+    const [sweep] = await conn.query(
+      `DELETE FROM hourly_product_performance_rollup WHERE date = ? AND updated_at < ?`,
+      [targetYmd, runStartedAt],
+    );
+
     console.log(
-      `[${brand.name}] Product performance rollup refreshed for ${targetYmd}. Rows: ${result.affectedRows || 0}`,
+      `[${brand.name}] Product performance rollup upserted for ${targetYmd}. Rows: ${result.affectedRows || 0}; swept ${sweep.affectedRows} stale.`,
     );
   } finally {
     conn.release();
@@ -1866,9 +2030,11 @@ async function processBrand(brand, targetYmd) {
 async function runPipelineForDate(targetYmd) {
   const brands = await getBrands();
   console.log(
-    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd})\n`,
+    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
   );
-  await Promise.all(brands.map((b) => processBrand(b, targetYmd)));
+  await mapWithConcurrency(brands, HOURLY_BRAND_CONCURRENCY, (b) =>
+    processBrand(b, targetYmd),
+  );
   console.log(`\n✅ All brands completed for ${targetYmd}.\n`);
 }
 
