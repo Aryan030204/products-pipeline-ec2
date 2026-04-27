@@ -24,3 +24,4 @@ services:
 networks:
   pipeline-net:
     name: pipeline-net
+    external: true
