@@ -18,6 +18,7 @@
  */
 
 import "dotenv/config";
+import dotenv from "dotenv";
 import mysql from "mysql2/promise";
 import axios from "axios";
 import cron from "node-cron";
@@ -204,8 +205,194 @@ function decryptAES(encryptedValue) {
   }
 }
 
+function decryptAESMaybe(encryptedValue) {
+  if (!encryptedValue) return encryptedValue;
+  if (!encryptedValue.includes(":")) return encryptedValue;
+  if (!PASSWORD_AES_KEY) {
+    throw new Error(
+      "[INIT] PASSWORD_AES_KEY is required to decrypt encrypted values from .env.local",
+    );
+  }
+  return decryptAES(encryptedValue);
+}
+
+function pickField(obj, keys) {
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+  }
+  return undefined;
+}
+
+async function loadBrandsFromEnvLocal() {
+  const envLocalPath = new URL(".env.local", import.meta.url);
+  if (!fs.existsSync(envLocalPath)) {
+    console.error("[INIT] TEST_MODE is true but .env.local was not found.");
+    process.exit(1);
+  }
+
+  let envLocal;
+  try {
+    const raw = fs.readFileSync(envLocalPath, "utf8");
+    envLocal = dotenv.parse(raw);
+  } catch (err) {
+    console.error("[INIT] Failed to read .env.local:", err.message);
+    process.exit(1);
+  }
+
+  const brandsJson = envLocal.BRANDS_JSON;
+  if (!brandsJson) {
+    console.error(
+      "[INIT] .env.local must define BRANDS_JSON when TEST_MODE is true.",
+    );
+    process.exit(1);
+  }
+
+  let brandList;
+  try {
+    brandList = JSON.parse(brandsJson);
+  } catch (err) {
+    console.error("[INIT] Failed to parse BRANDS_JSON:", err.message);
+    process.exit(1);
+  }
+
+  if (!Array.isArray(brandList) || brandList.length === 0) {
+    console.error("[INIT] BRANDS_JSON must be a non-empty array.");
+    process.exit(1);
+  }
+
+  console.log(`[INIT] Loading ${brandList.length} brands from .env.local...`);
+
+  const brands = [];
+  let index = 0;
+
+  for (const brandData of brandList) {
+    const idRaw = pickField(brandData, ["id", "brand_id"]);
+    const id = Number.isFinite(Number(idRaw)) ? Number(idRaw) : index + 1;
+
+    const shopName = pickField(brandData, ["shop_name", "shopName"]);
+    const apiVersion = pickField(brandData, ["api_version", "apiVersion"]);
+    const dbHost = pickField(brandData, ["db_host", "dbHost"]);
+    const dbUser = pickField(brandData, ["db_user", "dbUser"]);
+    const dbDatabase = pickField(brandData, ["db_database", "dbDatabase"]);
+    const brandTag =
+      pickField(brandData, ["brand_tag", "brandTag"]) || `brand_${index}`;
+    const brandName =
+      pickField(brandData, ["brand_name", "brandName"]) ||
+      brandTag.toUpperCase();
+
+    let accessToken, dbPassword;
+    try {
+      accessToken = decryptAESMaybe(
+        pickField(brandData, ["access_token", "accessToken"]),
+      );
+      dbPassword = decryptAESMaybe(
+        pickField(brandData, ["db_password", "dbPassword"]),
+      );
+    } catch (err) {
+      console.error(
+        `[INIT] Skipping brand ${brandName} – failed to decrypt credentials.`,
+      );
+      continue;
+    }
+
+    const dbSslEnabledEnv = String(
+      process.env.DB_SSL_ENABLED || "",
+    ).toLowerCase();
+    let dbSslEnabled = dbSslEnabledEnv === "true";
+
+    if (
+      !dbSslEnabled &&
+      dbHost &&
+      dbSslEnabledEnv === "" &&
+      /amazonaws\.com$/i.test(dbHost) &&
+      !TEST_MODE
+    ) {
+      dbSslEnabled = true;
+    }
+
+    if (TEST_MODE) {
+      console.warn(
+        `[INIT] Brand [${brandName}] TEST MODE ENABLED: SSL explicitly disabled.`,
+      );
+    }
+
+    const dbSslCa = process.env.DB_SSL_CA;
+    const dbSslCaFile = process.env.DB_SSL_CA_FILE;
+    let ssl;
+    if (dbSslEnabled || dbSslCa || dbSslCaFile) {
+      let ca = dbSslCa ? dbSslCa.replace(/\\n/g, "\n") : undefined;
+      if (!ca && dbSslCaFile) {
+        try {
+          ca = fs.readFileSync(dbSslCaFile, "utf8");
+        } catch (err) {
+          console.warn(
+            `[INIT] Failed to read CA file for brand ${brandName} (${dbSslCaFile}): ${err?.message}`,
+          );
+        }
+      }
+
+      ssl = {
+        rejectUnauthorized: false,
+        ...(ca ? { ca } : {}),
+      };
+    }
+
+    if (
+      !shopName ||
+      !apiVersion ||
+      !accessToken ||
+      !dbHost ||
+      !dbUser ||
+      !dbDatabase
+    ) {
+      console.warn(
+        `[INIT] Skipping brand ${brandName} – missing required fields.`,
+      );
+      continue;
+    }
+
+    const pool = mysql.createPool({
+      host: dbHost,
+      user: dbUser,
+      password: dbPassword,
+      database: dbDatabase,
+      waitForConnections: true,
+      connectionLimit: 5,
+      queueLimit: 0,
+      ...(ssl && !TEST_MODE ? { ssl } : {}),
+    });
+
+    brands.push({
+      index,
+      id,
+      tag: brandTag,
+      name: brandName,
+      shopName,
+      apiVersion,
+      accessToken,
+      dbDatabase,
+      pool,
+      _tablesEnsured: false,
+    });
+
+    console.log(
+      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`,
+    );
+    index++;
+  }
+
+  console.log(
+    `[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`,
+  );
+  return brands;
+}
+
 // ---------- Brand config ----------
 async function loadBrands() {
+  if (TEST_MODE) {
+    return loadBrandsFromEnvLocal();
+  }
+
   if (!GET_BRANDS_API || !PIPELINE_AUTH_HEADER || !PASSWORD_AES_KEY) {
     console.error(
       "[INIT] Missing required environment variables: GET_BRANDS_API, PIPELINE_AUTH_HEADER, PASSWORD_AES_KEY",
@@ -2090,6 +2277,32 @@ async function safeRun(trigger = "unknown") {
   const startedAt = fmtIST();
   console.log(`\n[SCHED] Starting pipeline (${trigger}) @ ${startedAt}\n`);
 
+  let runId = null;
+  const isManual = trigger === "manual_http";
+  
+  if (isManual) {
+    runId = crypto.randomUUID();
+    const managerStartedEndpoint = process.env.MANAGER_STARTED_ENDPOINT;
+    const pipelineId = process.env.PIPELINE_ID;
+    
+    if (managerStartedEndpoint && pipelineId) {
+      try {
+        await axios.post(managerStartedEndpoint, {
+          runId,
+          pipelineId,
+          status: "running"
+        }, {
+          headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER }
+        });
+        console.log(`[SCHED] Reported 'running' status to manager for runId: ${runId}`);
+      } catch (err) {
+        console.warn(`[SCHED] Failed to report 'running' status: ${err.message}`);
+      }
+    } else {
+      console.warn(`[SCHED] MANAGER_STARTED_ENDPOINT or PIPELINE_ID not set. Skipping 'running' status report.`);
+    }
+  }
+
   try {
     if (BACKFILL_MODE) {
       await runBackfillPipeline();
@@ -2097,6 +2310,26 @@ async function safeRun(trigger = "unknown") {
       await runPipelineForDate(todayISTYMD());
     }
     console.log(`\n[SCHED] Pipeline completed (${trigger}) @ ${fmtIST()}\n`);
+
+    if (isManual && runId) {
+      const managerCompletedEndpoint = process.env.MANAGER_COMPLETED_ENDPOINT;
+      const pipelineId = process.env.PIPELINE_ID;
+      
+      if (managerCompletedEndpoint && pipelineId) {
+        try {
+          await axios.post(managerCompletedEndpoint, {
+            runId,
+            pipelineId,
+            status: "completed"
+          }, {
+            headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER }
+          });
+          console.log(`[SCHED] Reported 'completed' status to manager for runId: ${runId}`);
+        } catch (err) {
+          console.warn(`[SCHED] Failed to report 'completed' status: ${err.message}`);
+        }
+      }
+    }
   } catch (err) {
     console.error(`[SCHED] Pipeline crashed (${trigger}) @ ${fmtIST()}:`, err);
   } finally {
