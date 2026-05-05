@@ -27,6 +27,79 @@ import express from "express";
 import { pathToFileURL } from "url";
 import crypto from "crypto";
 
+// ---------- Runtime log capture (last 2 lines) ----------
+const RUNTIME_LOG_LIMIT = 2;
+const runtimeLogs = [];
+
+function formatLogArg(arg) {
+  if (typeof arg === "string") return arg;
+  if (arg instanceof Error) return arg.stack || arg.message || String(arg);
+  try {
+    return JSON.stringify(arg);
+  } catch {
+    return String(arg);
+  }
+}
+
+function pushRuntimeLog(level, args) {
+  const line = `[${level}] ${args.map(formatLogArg).join(" ")}`.trim();
+  if (!line) return;
+  runtimeLogs.push(line);
+  while (runtimeLogs.length > RUNTIME_LOG_LIMIT) runtimeLogs.shift();
+}
+
+const baseConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+
+console.log = (...args) => {
+  pushRuntimeLog("INFO", args);
+  baseConsole.log(...args);
+};
+
+console.warn = (...args) => {
+  pushRuntimeLog("WARN", args);
+  baseConsole.warn(...args);
+};
+
+console.error = (...args) => {
+  pushRuntimeLog("ERROR", args);
+  baseConsole.error(...args);
+};
+
+function getLastRuntimeLogs() {
+  return runtimeLogs.slice(-RUNTIME_LOG_LIMIT).join("\n");
+}
+
+function normalizeErrorCode(value) {
+  const normalized = String(value || "")
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  return normalized || "UNKNOWN_ERROR";
+}
+
+function deriveErrorCode(err) {
+  const code = err?.code || err?.name || "Error";
+  const message = String(err?.message || "");
+  const combined = `${code} ${message}`.toLowerCase();
+
+  if (combined.includes("timeout")) return "DB_TIMEOUT";
+  if (combined.includes("access denied") || combined.includes("er_access_denied_error")) {
+    return "DB_AUTH_FAILED";
+  }
+  if (combined.includes("econnrefused") || combined.includes("enotfound")) {
+    return "NETWORK_ERROR";
+  }
+  if (combined.includes("env") || combined.includes("missing") || combined.includes("password_aes_key")) {
+    return "ENV_ERROR";
+  }
+
+  return normalizeErrorCode(code);
+}
+
 // ---------- Time helpers ----------
 const IST_OFFSET_MIN = 330; // +05:30
 
@@ -223,6 +296,46 @@ function pickField(obj, keys) {
   return undefined;
 }
 
+function parseCsv(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildBrandListFromIndexedEnv(envLocal) {
+  const explicitIndexes = new Set(
+    Object.keys(envLocal)
+      .map((key) =>
+        key.match(/^(?:BRAND_ID|SHOP_NAME|ACCESS_TOKEN|DB_HOST)_(\d+)$/),
+      )
+      .filter(Boolean)
+      .map((match) => Number(match[1])),
+  );
+
+  const activeBrandIds = parseCsv(envLocal.ACTIVE_BRAND_IDS);
+  if (activeBrandIds.length) {
+    for (let index = 0; index < activeBrandIds.length; index++) {
+      explicitIndexes.add(index);
+    }
+  }
+
+  return Array.from(explicitIndexes)
+    .sort((a, b) => a - b)
+    .map((index) => ({
+      id: envLocal[`BRAND_ID_${index}`] || activeBrandIds[index] || index + 1,
+      shop_name: envLocal[`SHOP_NAME_${index}`],
+      api_version: envLocal[`API_VERSION_${index}`] || envLocal.API_VERSION,
+      access_token: envLocal[`ACCESS_TOKEN_${index}`],
+      db_host: envLocal[`DB_HOST_${index}`],
+      db_user: envLocal[`DB_USER_${index}`],
+      db_password: envLocal[`DB_PASSWORD_${index}`],
+      db_database: envLocal[`DB_DATABASE_${index}`],
+      brand_tag: envLocal[`BRAND_TAG_${index}`],
+      brand_name: envLocal[`BRAND_NAME_${index}`],
+    }));
+}
+
 async function loadBrandsFromEnvLocal() {
   const envLocalPath = new URL(".env.local", import.meta.url);
   if (!fs.existsSync(envLocalPath)) {
@@ -239,24 +352,23 @@ async function loadBrandsFromEnvLocal() {
     process.exit(1);
   }
 
-  const brandsJson = envLocal.BRANDS_JSON;
-  if (!brandsJson) {
-    console.error(
-      "[INIT] .env.local must define BRANDS_JSON when TEST_MODE is true.",
-    );
-    process.exit(1);
-  }
-
   let brandList;
-  try {
-    brandList = JSON.parse(brandsJson);
-  } catch (err) {
-    console.error("[INIT] Failed to parse BRANDS_JSON:", err.message);
-    process.exit(1);
+  const brandsJson = envLocal.BRANDS_JSON;
+  if (brandsJson) {
+    try {
+      brandList = JSON.parse(brandsJson);
+    } catch (err) {
+      console.error("[INIT] Failed to parse BRANDS_JSON:", err.message);
+      process.exit(1);
+    }
+  } else {
+    brandList = buildBrandListFromIndexedEnv(envLocal);
   }
 
   if (!Array.isArray(brandList) || brandList.length === 0) {
-    console.error("[INIT] BRANDS_JSON must be a non-empty array.");
+    console.error(
+      "[INIT] .env.local must define BRANDS_JSON or indexed brand variables like BRAND_ID_0, SHOP_NAME_0, ACCESS_TOKEN_0, DB_HOST_0 when TEST_MODE is true.",
+    );
     process.exit(1);
   }
 
@@ -2265,7 +2377,7 @@ async function runBackfillPipeline() {
 // ---------- Scheduler wrapper ----------
 let running = false;
 
-async function safeRun(trigger = "unknown") {
+async function safeRun(trigger = "unknown", options = {}) {
   if (running) {
     console.log(
       `[SCHED] Skipping run (${trigger}) because previous run is still running.`,
@@ -2281,7 +2393,7 @@ async function safeRun(trigger = "unknown") {
   const isManual = trigger === "manual_http";
   
   if (isManual) {
-    runId = crypto.randomUUID();
+    runId = options.runId;
     const managerStartedEndpoint = process.env.MANAGER_STARTED_ENDPOINT;
     const pipelineId = process.env.PIPELINE_ID;
     
@@ -2332,6 +2444,41 @@ async function safeRun(trigger = "unknown") {
     }
   } catch (err) {
     console.error(`[SCHED] Pipeline crashed (${trigger}) @ ${fmtIST()}:`, err);
+
+    if (isManual && runId) {
+      const managerFailedEndpoint = process.env.MANAGER_FAILED_ENDPOINT;
+      const pipelineId = process.env.PIPELINE_ID;
+      const errorCode = deriveErrorCode(err);
+      const errorBody = getLastRuntimeLogs() || (err?.message || String(err));
+
+      if (managerFailedEndpoint && pipelineId) {
+        try {
+          await axios.post(
+            managerFailedEndpoint,
+            {
+              pipelineId,
+              runId,
+              errorCode,
+              errorBody,
+            },
+            {
+              headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER },
+            },
+          );
+          console.log(
+            `[SCHED] Reported 'failed' status to manager for runId: ${runId}`,
+          );
+        } catch (reportErr) {
+          console.warn(
+            `[SCHED] Failed to report 'failed' status: ${reportErr.message}`,
+          );
+        }
+      } else {
+        console.warn(
+          `[SCHED] MANAGER_FAILED_ENDPOINT or PIPELINE_ID not set. Skipping 'failed' status report.`,
+        );
+      }
+    }
   } finally {
     running = false;
   }
@@ -2387,6 +2534,12 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   // Generic Manual Triggering
   const app = express();
   const PORT = process.env.PORT || 8080;
+  app.use(express.json());
+
+  function getManualRunId(req) {
+    const runId = req.body?.runId;
+    return typeof runId === "string" ? runId.trim() : "";
+  }
 
   // Authenticated manual trigger
   app.post("/trigger", (req, res) => {
@@ -2396,10 +2549,16 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
+    const runId = getManualRunId(req);
+    if (!runId) {
+      return res.status(400).json({ error: "runId is required" });
+    }
+
     console.log(`[SERVER] /trigger triggered manually.`);
-    safeRun("manual_http");
+    safeRun("manual_http", { runId });
     res.json({
       status: "triggered",
+      runId,
       message: "Pipeline trigger received. Check logs for progress.",
       timestamp: fmtIST(),
     });
@@ -2411,8 +2570,14 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     if (authKey !== PIPELINE_AUTH_HEADER) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    safeRun("manual_http");
-    res.json({ status: "triggered", timestamp: fmtIST() });
+
+    const runId = getManualRunId(req);
+    if (!runId) {
+      return res.status(400).json({ error: "runId is required" });
+    }
+
+    safeRun("manual_http", { runId });
+    res.json({ status: "triggered", runId, timestamp: fmtIST() });
   });
 
   app.listen(PORT, () => {
