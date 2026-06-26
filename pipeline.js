@@ -9,8 +9,8 @@
  *   BACKFILL_START_IST_DATE=2025-10-01
  *   BACKFILL_END_IST_DATE=2025-12-14
  *
- * Optional:
- *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (default)
+ * Optional fallback:
+ *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (used only when a brand has no valid store_timezone)
  *
  * Hourly product sessions (full dimensions):
  *   HOURLY_PRODUCT_SESSIONS_ENABLED=true
@@ -136,6 +136,63 @@ function todayISTYMD() {
   return fmtDate(todayISTDate());
 }
 
+function isValidTimeZone(timeZone) {
+  if (!timeZone) return false;
+  try {
+    Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extractIanaTimeZone(storeTimezoneValue) {
+  const raw = String(storeTimezoneValue || "").trim();
+  if (!raw) return null;
+  if (isValidTimeZone(raw)) return raw;
+
+  const match = raw.match(/([A-Za-z_]+(?:\/[A-Za-z0-9_+\-]+)+)$/);
+  if (!match) return null;
+
+  const candidate = match[1];
+  return isValidTimeZone(candidate) ? candidate : null;
+}
+
+function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
+  const parsed = extractIanaTimeZone(storeTimezoneValue);
+  if (parsed) return parsed;
+
+  if (storeTimezoneValue) {
+    console.warn(
+      `[INIT] Brand ${brandName} has invalid store_timezone="${storeTimezoneValue}". Falling back to ${DEFAULT_SHOPIFYQL_TIMEZONE}.`,
+    );
+  }
+
+  return DEFAULT_SHOPIFYQL_TIMEZONE;
+}
+
+function getDatePartsInTimeZone(timeZone, date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return {
+    year: values.year,
+    month: values.month,
+    day: values.day,
+  };
+}
+
+function todayYMDInTimeZone(timeZone) {
+  const { year, month, day } = getDatePartsInTimeZone(timeZone);
+  return `${year}-${month}-${day}`;
+}
+
 // ---------- Backfill env ----------
 const BACKFILL_MODE =
   String(process.env.BACKFILL_MODE || "")
@@ -151,7 +208,8 @@ const BACKFILL_END_IST_DATE = (
   process.env.BACKFILL_END_IST ||
   ""
 ).split("T")[0]; // YYYY-MM-DD
-const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
+const DEFAULT_SHOPIFYQL_TIMEZONE =
+  process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 const TEST_MODE = process.env.TEST_MODE === "true";
 const BACKFILL_BRAND_CONCURRENCY = Math.max(
   1,
@@ -333,6 +391,7 @@ function buildBrandListFromIndexedEnv(envLocal) {
       db_database: envLocal[`DB_DATABASE_${index}`],
       brand_tag: envLocal[`BRAND_TAG_${index}`],
       brand_name: envLocal[`BRAND_NAME_${index}`],
+      store_timezone: envLocal[`STORE_TIMEZONE_${index}`],
     }));
 }
 
@@ -391,6 +450,11 @@ async function loadBrandsFromEnvLocal() {
     const brandName =
       pickField(brandData, ["brand_name", "brandName"]) ||
       brandTag.toUpperCase();
+    const storeTimezone = pickField(brandData, [
+      "store_timezone",
+      "storeTimezone",
+    ]);
+    const shopifyQlTimezone = resolveBrandTimeZone(storeTimezone, brandName);
 
     let accessToken, dbPassword;
     try {
@@ -482,13 +546,15 @@ async function loadBrandsFromEnvLocal() {
       shopName,
       apiVersion,
       accessToken,
+      storeTimezone,
+      shopifyQlTimezone,
       dbDatabase,
       pool,
       _tablesEnsured: false,
     });
 
     console.log(
-      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`,
+      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase}, tz=${shopifyQlTimezone})`,
     );
     index++;
   }
@@ -552,6 +618,8 @@ async function loadBrands() {
     const dbDatabase = brandData.db_database;
     const brandTag = brandData.brand_tag || `brand_${index}`;
     const brandName = brandData.brand_name || brandTag.toUpperCase();
+    const storeTimezone = brandData.store_timezone;
+    const shopifyQlTimezone = resolveBrandTimeZone(storeTimezone, brandName);
 
     let accessToken, dbPassword;
     try {
@@ -641,13 +709,15 @@ async function loadBrands() {
       shopName,
       apiVersion,
       accessToken,
+      storeTimezone,
+      shopifyQlTimezone,
       dbDatabase,
       pool,
       _tablesEnsured: false,
     });
 
     console.log(
-      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`,
+      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase}, tz=${shopifyQlTimezone})`,
     );
     index++;
   }
@@ -1213,15 +1283,17 @@ function formatShopifyQLTable(tableData) {
   return out;
 }
 
-function buildDayClause(targetYmd) {
+function buildDayClause(targetYmd, timeZone = DEFAULT_SHOPIFYQL_TIMEZONE) {
   // Avoid "future UNTIL" for today; use DURING today for current day runs.
-  if (!targetYmd || targetYmd === todayISTYMD()) return `DURING today`;
+  if (!targetYmd || targetYmd === todayYMDInTimeZone(timeZone)) {
+    return `DURING today`;
+  }
   return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
 }
 
-function buildShopifyQLQuery(targetYmd = null) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLQuery(brand, targetYmd = null) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1257,7 +1329,7 @@ function buildShopifyQLQuery(targetYmd = null) {
 
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
-  const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
+  const q = buildShopifyQLQuery(brand, targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
@@ -1301,9 +1373,9 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
-function buildShopifyQLHourlyQuery(targetYmd = null) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLHourlyQuery(brand, targetYmd = null) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1323,7 +1395,7 @@ function buildShopifyQLHourlyQuery(targetYmd = null) {
 
 async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
-  const q = buildShopifyQLHourlyQuery(targetYmd).replace(/"/g, '\\"');
+  const q = buildShopifyQLHourlyQuery(brand, targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
@@ -1382,9 +1454,9 @@ function getThrottleResetSleepMsFromGraphQLErrors(errors) {
   return Math.max(0, resetAt - Date.now()) + 250;
 }
 
-function buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1420,9 +1492,9 @@ function buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd) {
   `.replace(/\n+/g, " ");
 }
 
-function buildShopifyQLHourlyDimensionQuery(targetYmd, hour) {
+function buildShopifyQLHourlyDimensionQuery(brand, targetYmd, hour) {
   const hourClause = buildHourClause(targetYmd, hour);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1472,7 +1544,7 @@ async function fetchHourlyDimensionSessions(brand, targetYmd) {
   // Fast path: try a single query that includes hour_of_day in the GROUP BY.
   // If it returns < LIMIT rows, we can use it and avoid 24 separate hour slices.
   try {
-    const qAll = buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd).replace(
+    const qAll = buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd).replace(
       /"/g,
       '\\"',
     );
@@ -1601,7 +1673,7 @@ async function fetchHourlyDimensionSessions(brand, targetYmd) {
   }
 
   for (let h = 0; h < 24; h++) {
-    const q = buildShopifyQLHourlyDimensionQuery(targetYmd, h).replace(/"/g, '\\"');
+    const q = buildShopifyQLHourlyDimensionQuery(brand, targetYmd, h).replace(/"/g, '\\"');
     const graphql = {
       query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
     };
@@ -2284,14 +2356,17 @@ async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
 }
 
 // ---------- Pipeline per brand (date-aware) ----------
-async function processBrand(brand, targetYmd) {
+async function processBrand(brand, requestedTargetYmd) {
+  const targetYmd = requestedTargetYmd || todayYMDInTimeZone(brand.shopifyQlTimezone);
   const startTotal = Date.now();
-  console.log(`\n========== ${brand.tag} (${targetYmd}) START ==========\n`);
+  console.log(
+    `\n========== ${brand.tag} (${targetYmd}, tz=${brand.shopifyQlTimezone}) START ==========\n`,
+  );
 
   await ensureTablesForBrand(brand);
 
-  // Product sync once per real IST day (not per backfill date)
-  const realToday = todayISTYMD();
+  // Product sync once per real brand-local day (not per backfill date)
+  const realToday = todayYMDInTimeZone(brand.shopifyQlTimezone);
   const lastSync = await getLastProductSyncDate(brand);
 
   if (lastSync !== realToday) {
@@ -2331,12 +2406,12 @@ async function processBrand(brand, targetYmd) {
 async function runPipelineForDate(targetYmd) {
   const brands = await getBrands();
   console.log(
-    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
+    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd || "brand-local today"}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
   );
   await mapWithConcurrency(brands, HOURLY_BRAND_CONCURRENCY, (b) =>
     processBrand(b, targetYmd),
   );
-  console.log(`\n✅ All brands completed for ${targetYmd}.\n`);
+  console.log(`\n✅ All brands completed for ${targetYmd || "brand-local today"}.\n`);
 }
 
 async function runBackfillPipeline() {
@@ -2419,7 +2494,7 @@ async function safeRun(trigger = "unknown", options = {}) {
     if (BACKFILL_MODE) {
       await runBackfillPipeline();
     } else {
-      await runPipelineForDate(todayISTYMD());
+      await runPipelineForDate(null);
     }
     console.log(`\n[SCHED] Pipeline completed (${trigger}) @ ${fmtIST()}\n`);
 
