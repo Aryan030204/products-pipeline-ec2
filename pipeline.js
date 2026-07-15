@@ -9,8 +9,8 @@
  *   BACKFILL_START_IST_DATE=2025-10-01
  *   BACKFILL_END_IST_DATE=2025-12-14
  *
- * Optional:
- *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (default)
+ * Optional fallback:
+ *   SHOPIFYQL_TIMEZONE=Asia/Kolkata   (used only when a brand has no valid store_timezone)
  *
  * Hourly product sessions (full dimensions):
  *   HOURLY_PRODUCT_SESSIONS_ENABLED=true
@@ -18,6 +18,7 @@
  */
 
 import "dotenv/config";
+import dotenv from "dotenv";
 import mysql from "mysql2/promise";
 import axios from "axios";
 import cron from "node-cron";
@@ -25,6 +26,79 @@ import fs from "fs";
 import express from "express";
 import { pathToFileURL } from "url";
 import crypto from "crypto";
+
+// ---------- Runtime log capture (last 2 lines) ----------
+const RUNTIME_LOG_LIMIT = 2;
+const runtimeLogs = [];
+
+function formatLogArg(arg) {
+  if (typeof arg === "string") return arg;
+  if (arg instanceof Error) return arg.stack || arg.message || String(arg);
+  try {
+    return JSON.stringify(arg);
+  } catch {
+    return String(arg);
+  }
+}
+
+function pushRuntimeLog(level, args) {
+  const line = `[${level}] ${args.map(formatLogArg).join(" ")}`.trim();
+  if (!line) return;
+  runtimeLogs.push(line);
+  while (runtimeLogs.length > RUNTIME_LOG_LIMIT) runtimeLogs.shift();
+}
+
+const baseConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+
+console.log = (...args) => {
+  pushRuntimeLog("INFO", args);
+  baseConsole.log(...args);
+};
+
+console.warn = (...args) => {
+  pushRuntimeLog("WARN", args);
+  baseConsole.warn(...args);
+};
+
+console.error = (...args) => {
+  pushRuntimeLog("ERROR", args);
+  baseConsole.error(...args);
+};
+
+function getLastRuntimeLogs() {
+  return runtimeLogs.slice(-RUNTIME_LOG_LIMIT).join("\n");
+}
+
+function normalizeErrorCode(value) {
+  const normalized = String(value || "")
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  return normalized || "UNKNOWN_ERROR";
+}
+
+function deriveErrorCode(err) {
+  const code = err?.code || err?.name || "Error";
+  const message = String(err?.message || "");
+  const combined = `${code} ${message}`.toLowerCase();
+
+  if (combined.includes("timeout")) return "DB_TIMEOUT";
+  if (combined.includes("access denied") || combined.includes("er_access_denied_error")) {
+    return "DB_AUTH_FAILED";
+  }
+  if (combined.includes("econnrefused") || combined.includes("enotfound")) {
+    return "NETWORK_ERROR";
+  }
+  if (combined.includes("env") || combined.includes("missing") || combined.includes("password_aes_key")) {
+    return "ENV_ERROR";
+  }
+
+  return normalizeErrorCode(code);
+}
 
 // ---------- Time helpers ----------
 const IST_OFFSET_MIN = 330; // +05:30
@@ -62,6 +136,63 @@ function todayISTYMD() {
   return fmtDate(todayISTDate());
 }
 
+function isValidTimeZone(timeZone) {
+  if (!timeZone) return false;
+  try {
+    Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extractIanaTimeZone(storeTimezoneValue) {
+  const raw = String(storeTimezoneValue || "").trim();
+  if (!raw) return null;
+  if (isValidTimeZone(raw)) return raw;
+
+  const match = raw.match(/([A-Za-z_]+(?:\/[A-Za-z0-9_+\-]+)+)$/);
+  if (!match) return null;
+
+  const candidate = match[1];
+  return isValidTimeZone(candidate) ? candidate : null;
+}
+
+function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
+  const parsed = extractIanaTimeZone(storeTimezoneValue);
+  if (parsed) return parsed;
+
+  if (storeTimezoneValue) {
+    console.warn(
+      `[INIT] Brand ${brandName} has invalid store_timezone="${storeTimezoneValue}". Falling back to ${DEFAULT_SHOPIFYQL_TIMEZONE}.`,
+    );
+  }
+
+  return DEFAULT_SHOPIFYQL_TIMEZONE;
+}
+
+function getDatePartsInTimeZone(timeZone, date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return {
+    year: values.year,
+    month: values.month,
+    day: values.day,
+  };
+}
+
+function todayYMDInTimeZone(timeZone) {
+  const { year, month, day } = getDatePartsInTimeZone(timeZone);
+  return `${year}-${month}-${day}`;
+}
+
 // ---------- Backfill env ----------
 const BACKFILL_MODE =
   String(process.env.BACKFILL_MODE || "")
@@ -77,7 +208,8 @@ const BACKFILL_END_IST_DATE = (
   process.env.BACKFILL_END_IST ||
   ""
 ).split("T")[0]; // YYYY-MM-DD
-const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
+const DEFAULT_SHOPIFYQL_TIMEZONE =
+  process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 const TEST_MODE = process.env.TEST_MODE === "true";
 const BACKFILL_BRAND_CONCURRENCY = Math.max(
   1,
@@ -93,6 +225,8 @@ const HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED =
   String(process.env.HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED || "").toLowerCase().trim() === "true";
 const HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS =
   parseInt(process.env.HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS || "7", 10);
+const SELF_RUN =
+  String(process.env.SELF_RUN || "true").toLowerCase().trim() === "true";
 
 // Daily sessions fetch paginates via ShopifyQL LIMIT/OFFSET (a single query is
 // capped at 1000 rows, which truncated the long tail and undercounted per-page
@@ -220,8 +354,241 @@ function decryptAES(encryptedValue) {
   }
 }
 
+function decryptAESMaybe(encryptedValue) {
+  if (!encryptedValue) return encryptedValue;
+  if (!encryptedValue.includes(":")) return encryptedValue;
+  if (!PASSWORD_AES_KEY) {
+    throw new Error(
+      "[INIT] PASSWORD_AES_KEY is required to decrypt encrypted values from .env.local",
+    );
+  }
+  return decryptAES(encryptedValue);
+}
+
+function pickField(obj, keys) {
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+  }
+  return undefined;
+}
+
+function parseCsv(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildBrandListFromIndexedEnv(envLocal) {
+  const explicitIndexes = new Set(
+    Object.keys(envLocal)
+      .map((key) =>
+        key.match(/^(?:BRAND_ID|SHOP_NAME|ACCESS_TOKEN|DB_HOST)_(\d+)$/),
+      )
+      .filter(Boolean)
+      .map((match) => Number(match[1])),
+  );
+
+  const activeBrandIds = parseCsv(envLocal.ACTIVE_BRAND_IDS);
+  if (activeBrandIds.length) {
+    for (let index = 0; index < activeBrandIds.length; index++) {
+      explicitIndexes.add(index);
+    }
+  }
+
+  return Array.from(explicitIndexes)
+    .sort((a, b) => a - b)
+    .map((index) => ({
+      id: envLocal[`BRAND_ID_${index}`] || activeBrandIds[index] || index + 1,
+      shop_name: envLocal[`SHOP_NAME_${index}`],
+      api_version: envLocal[`API_VERSION_${index}`] || envLocal.API_VERSION,
+      access_token: envLocal[`ACCESS_TOKEN_${index}`],
+      db_host: envLocal[`DB_HOST_${index}`],
+      db_user: envLocal[`DB_USER_${index}`],
+      db_password: envLocal[`DB_PASSWORD_${index}`],
+      db_database: envLocal[`DB_DATABASE_${index}`],
+      brand_tag: envLocal[`BRAND_TAG_${index}`],
+      brand_name: envLocal[`BRAND_NAME_${index}`],
+      store_timezone: envLocal[`STORE_TIMEZONE_${index}`],
+    }));
+}
+
+async function loadBrandsFromEnvLocal() {
+  const envLocalPath = new URL(".env.local", import.meta.url);
+  if (!fs.existsSync(envLocalPath)) {
+    console.error("[INIT] TEST_MODE is true but .env.local was not found.");
+    process.exit(1);
+  }
+
+  let envLocal;
+  try {
+    const raw = fs.readFileSync(envLocalPath, "utf8");
+    envLocal = dotenv.parse(raw);
+  } catch (err) {
+    console.error("[INIT] Failed to read .env.local:", err.message);
+    process.exit(1);
+  }
+
+  let brandList;
+  const brandsJson = envLocal.BRANDS_JSON;
+  if (brandsJson) {
+    try {
+      brandList = JSON.parse(brandsJson);
+    } catch (err) {
+      console.error("[INIT] Failed to parse BRANDS_JSON:", err.message);
+      process.exit(1);
+    }
+  } else {
+    brandList = buildBrandListFromIndexedEnv(envLocal);
+  }
+
+  if (!Array.isArray(brandList) || brandList.length === 0) {
+    console.error(
+      "[INIT] .env.local must define BRANDS_JSON or indexed brand variables like BRAND_ID_0, SHOP_NAME_0, ACCESS_TOKEN_0, DB_HOST_0 when TEST_MODE is true.",
+    );
+    process.exit(1);
+  }
+
+  console.log(`[INIT] Loading ${brandList.length} brands from .env.local...`);
+
+  const brands = [];
+  let index = 0;
+
+  for (const brandData of brandList) {
+    const idRaw = pickField(brandData, ["id", "brand_id"]);
+    const id = Number.isFinite(Number(idRaw)) ? Number(idRaw) : index + 1;
+
+    const shopName = pickField(brandData, ["shop_name", "shopName"]);
+    const apiVersion = pickField(brandData, ["api_version", "apiVersion"]);
+    const dbHost = pickField(brandData, ["db_host", "dbHost"]);
+    const dbUser = pickField(brandData, ["db_user", "dbUser"]);
+    const dbDatabase = pickField(brandData, ["db_database", "dbDatabase"]);
+    const brandTag =
+      pickField(brandData, ["brand_tag", "brandTag"]) || `brand_${index}`;
+    const brandName =
+      pickField(brandData, ["brand_name", "brandName"]) ||
+      brandTag.toUpperCase();
+    const storeTimezone = pickField(brandData, [
+      "store_timezone",
+      "storeTimezone",
+    ]);
+    const shopifyQlTimezone = resolveBrandTimeZone(storeTimezone, brandName);
+
+    let accessToken, dbPassword;
+    try {
+      accessToken = decryptAESMaybe(
+        pickField(brandData, ["access_token", "accessToken"]),
+      );
+      dbPassword = decryptAESMaybe(
+        pickField(brandData, ["db_password", "dbPassword"]),
+      );
+    } catch (err) {
+      console.error(
+        `[INIT] Skipping brand ${brandName} – failed to decrypt credentials.`,
+      );
+      continue;
+    }
+
+    const dbSslEnabledEnv = String(
+      process.env.DB_SSL_ENABLED || "",
+    ).toLowerCase();
+    let dbSslEnabled = dbSslEnabledEnv === "true";
+
+    if (
+      !dbSslEnabled &&
+      dbHost &&
+      dbSslEnabledEnv === "" &&
+      /amazonaws\.com$/i.test(dbHost) &&
+      !TEST_MODE
+    ) {
+      dbSslEnabled = true;
+    }
+
+    if (TEST_MODE) {
+      console.warn(
+        `[INIT] Brand [${brandName}] TEST MODE ENABLED: SSL explicitly disabled.`,
+      );
+    }
+
+    const dbSslCa = process.env.DB_SSL_CA;
+    const dbSslCaFile = process.env.DB_SSL_CA_FILE;
+    let ssl;
+    if (dbSslEnabled || dbSslCa || dbSslCaFile) {
+      let ca = dbSslCa ? dbSslCa.replace(/\\n/g, "\n") : undefined;
+      if (!ca && dbSslCaFile) {
+        try {
+          ca = fs.readFileSync(dbSslCaFile, "utf8");
+        } catch (err) {
+          console.warn(
+            `[INIT] Failed to read CA file for brand ${brandName} (${dbSslCaFile}): ${err?.message}`,
+          );
+        }
+      }
+
+      ssl = {
+        rejectUnauthorized: false,
+        ...(ca ? { ca } : {}),
+      };
+    }
+
+    if (
+      !shopName ||
+      !apiVersion ||
+      !accessToken ||
+      !dbHost ||
+      !dbUser ||
+      !dbDatabase
+    ) {
+      console.warn(
+        `[INIT] Skipping brand ${brandName} – missing required fields.`,
+      );
+      continue;
+    }
+
+    const pool = mysql.createPool({
+      host: dbHost,
+      user: dbUser,
+      password: dbPassword,
+      database: dbDatabase,
+      waitForConnections: true,
+      connectionLimit: 5,
+      queueLimit: 0,
+      ...(ssl && !TEST_MODE ? { ssl } : {}),
+    });
+
+    brands.push({
+      index,
+      id,
+      tag: brandTag,
+      name: brandName,
+      shopName,
+      apiVersion,
+      accessToken,
+      storeTimezone,
+      shopifyQlTimezone,
+      dbDatabase,
+      pool,
+      _tablesEnsured: false,
+    });
+
+    console.log(
+      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase}, tz=${shopifyQlTimezone})`,
+    );
+    index++;
+  }
+
+  console.log(
+    `[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`,
+  );
+  return brands;
+}
+
 // ---------- Brand config ----------
 async function loadBrands() {
+  if (TEST_MODE) {
+    return loadBrandsFromEnvLocal();
+  }
+
   if (!GET_BRANDS_API || !PIPELINE_AUTH_HEADER || !PASSWORD_AES_KEY) {
     console.error(
       "[INIT] Missing required environment variables: GET_BRANDS_API, PIPELINE_AUTH_HEADER, PASSWORD_AES_KEY",
@@ -269,6 +636,8 @@ async function loadBrands() {
     const dbDatabase = brandData.db_database;
     const brandTag = brandData.brand_tag || `brand_${index}`;
     const brandName = brandData.brand_name || brandTag.toUpperCase();
+    const storeTimezone = brandData.store_timezone;
+    const shopifyQlTimezone = resolveBrandTimeZone(storeTimezone, brandName);
 
     let accessToken, dbPassword;
     try {
@@ -358,13 +727,15 @@ async function loadBrands() {
       shopName,
       apiVersion,
       accessToken,
+      storeTimezone,
+      shopifyQlTimezone,
       dbDatabase,
       pool,
       _tablesEnsured: false,
     });
 
     console.log(
-      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase})`,
+      `[INIT] Brand[${index}] ${brandName} ready (shop=${shopName}, db=${dbDatabase}, tz=${shopifyQlTimezone})`,
     );
     index++;
   }
@@ -930,9 +1301,11 @@ function formatShopifyQLTable(tableData) {
   return out;
 }
 
-function buildDayClause(targetYmd) {
+function buildDayClause(targetYmd, timeZone = DEFAULT_SHOPIFYQL_TIMEZONE) {
   // Avoid "future UNTIL" for today; use DURING today for current day runs.
-  if (!targetYmd || targetYmd === todayISTYMD()) return `DURING today`;
+  if (!targetYmd || targetYmd === todayYMDInTimeZone(timeZone)) {
+    return `DURING today`;
+  }
   return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
 }
 
@@ -946,9 +1319,13 @@ class ShopifyQLFetchError extends Error {
   }
 }
 
-function buildShopifyQLQuery(targetYmd = null, { limit = 1000, offset = 0 } = {}) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLQuery(
+  brand,
+  targetYmd = null,
+  { limit = 1000, offset = 0 } = {},
+) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
   const offsetClause = offset > 0 ? ` OFFSET ${offset}` : "";
 
   // ORDER BY must be a *total, stable* order across page requests, otherwise
@@ -1009,10 +1386,10 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
 
   for (let page = 0; page < SHOPIFYQL_MAX_PAGES; page++) {
     const offset = page * pageSize;
-    const q = buildShopifyQLQuery(targetYmd, { limit: pageSize, offset }).replace(
-      /"/g,
-      '\\"',
-    );
+    const q = buildShopifyQLQuery(brand, targetYmd, {
+      limit: pageSize,
+      offset,
+    }).replace(/"/g, '\\"');
     const graphql = {
       query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
     };
@@ -1135,9 +1512,9 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
-function buildShopifyQLHourlyQuery(targetYmd = null) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLHourlyQuery(brand, targetYmd = null) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1157,7 +1534,7 @@ function buildShopifyQLHourlyQuery(targetYmd = null) {
 
 async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
-  const q = buildShopifyQLHourlyQuery(targetYmd).replace(/"/g, '\\"');
+  const q = buildShopifyQLHourlyQuery(brand, targetYmd).replace(/"/g, '\\"');
 
   const graphql = {
     query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
@@ -1216,9 +1593,9 @@ function getThrottleResetSleepMsFromGraphQLErrors(errors) {
   return Math.max(0, resetAt - Date.now()) + 250;
 }
 
-function buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd) {
-  const dayClause = buildDayClause(targetYmd);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
+  const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1254,9 +1631,9 @@ function buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd) {
   `.replace(/\n+/g, " ");
 }
 
-function buildShopifyQLHourlyDimensionQuery(targetYmd, hour) {
+function buildShopifyQLHourlyDimensionQuery(brand, targetYmd, hour) {
   const hourClause = buildHourClause(targetYmd, hour);
-  const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sessions
@@ -1306,7 +1683,7 @@ async function fetchHourlyDimensionSessions(brand, targetYmd) {
   // Fast path: try a single query that includes hour_of_day in the GROUP BY.
   // If it returns < LIMIT rows, we can use it and avoid 24 separate hour slices.
   try {
-    const qAll = buildShopifyQLHourlyDimensionAllHoursQuery(targetYmd).replace(
+    const qAll = buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd).replace(
       /"/g,
       '\\"',
     );
@@ -1435,7 +1812,7 @@ async function fetchHourlyDimensionSessions(brand, targetYmd) {
   }
 
   for (let h = 0; h < 24; h++) {
-    const q = buildShopifyQLHourlyDimensionQuery(targetYmd, h).replace(/"/g, '\\"');
+    const q = buildShopifyQLHourlyDimensionQuery(brand, targetYmd, h).replace(/"/g, '\\"');
     const graphql = {
       query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
     };
@@ -2118,14 +2495,17 @@ async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
 }
 
 // ---------- Pipeline per brand (date-aware) ----------
-async function processBrand(brand, targetYmd) {
+async function processBrand(brand, requestedTargetYmd) {
+  const targetYmd = requestedTargetYmd || todayYMDInTimeZone(brand.shopifyQlTimezone);
   const startTotal = Date.now();
-  console.log(`\n========== ${brand.tag} (${targetYmd}) START ==========\n`);
+  console.log(
+    `\n========== ${brand.tag} (${targetYmd}, tz=${brand.shopifyQlTimezone}) START ==========\n`,
+  );
 
   await ensureTablesForBrand(brand);
 
-  // Product sync once per real IST day (not per backfill date)
-  const realToday = todayISTYMD();
+  // Product sync once per real brand-local day (not per backfill date)
+  const realToday = todayYMDInTimeZone(brand.shopifyQlTimezone);
   const lastSync = await getLastProductSyncDate(brand);
 
   if (lastSync !== realToday) {
@@ -2181,12 +2561,12 @@ async function processBrand(brand, targetYmd) {
 async function runPipelineForDate(targetYmd) {
   const brands = await getBrands();
   console.log(
-    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
+    `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd || "brand-local today"}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
   );
   await mapWithConcurrency(brands, HOURLY_BRAND_CONCURRENCY, (b) =>
     processBrand(b, targetYmd),
   );
-  console.log(`\n✅ All brands completed for ${targetYmd}.\n`);
+  console.log(`\n✅ All brands completed for ${targetYmd || "brand-local today"}.\n`);
 }
 
 async function runBackfillPipeline() {
@@ -2227,7 +2607,7 @@ async function runBackfillPipeline() {
 // ---------- Scheduler wrapper ----------
 let running = false;
 
-async function safeRun(trigger = "unknown") {
+async function safeRun(trigger = "unknown", options = {}) {
   if (running) {
     console.log(
       `[SCHED] Skipping run (${trigger}) because previous run is still running.`,
@@ -2239,15 +2619,96 @@ async function safeRun(trigger = "unknown") {
   const startedAt = fmtIST();
   console.log(`\n[SCHED] Starting pipeline (${trigger}) @ ${startedAt}\n`);
 
+  let runId = null;
+  const isManual = trigger === "manual_http";
+  
+  if (isManual) {
+    runId = options.runId;
+    const managerStartedEndpoint = process.env.MANAGER_STARTED_ENDPOINT;
+    const pipelineId = process.env.PIPELINE_ID;
+    
+    if (managerStartedEndpoint && pipelineId) {
+      try {
+        await axios.post(managerStartedEndpoint, {
+          runId,
+          pipelineId,
+          status: "running"
+        }, {
+          headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER }
+        });
+        console.log(`[SCHED] Reported 'running' status to manager for runId: ${runId}`);
+      } catch (err) {
+        console.warn(`[SCHED] Failed to report 'running' status: ${err.message}`);
+      }
+    } else {
+      console.warn(`[SCHED] MANAGER_STARTED_ENDPOINT or PIPELINE_ID not set. Skipping 'running' status report.`);
+    }
+  }
+
   try {
     if (BACKFILL_MODE) {
       await runBackfillPipeline();
     } else {
-      await runPipelineForDate(todayISTYMD());
+      await runPipelineForDate(null);
     }
     console.log(`\n[SCHED] Pipeline completed (${trigger}) @ ${fmtIST()}\n`);
+
+    if (isManual && runId) {
+      const managerCompletedEndpoint = process.env.MANAGER_COMPLETED_ENDPOINT;
+      const pipelineId = process.env.PIPELINE_ID;
+      
+      if (managerCompletedEndpoint && pipelineId) {
+        try {
+          await axios.post(managerCompletedEndpoint, {
+            runId,
+            pipelineId,
+            status: "completed"
+          }, {
+            headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER }
+          });
+          console.log(`[SCHED] Reported 'completed' status to manager for runId: ${runId}`);
+        } catch (err) {
+          console.warn(`[SCHED] Failed to report 'completed' status: ${err.message}`);
+        }
+      }
+    }
   } catch (err) {
     console.error(`[SCHED] Pipeline crashed (${trigger}) @ ${fmtIST()}:`, err);
+
+    if (isManual && runId) {
+      const managerFailedEndpoint = process.env.MANAGER_FAILED_ENDPOINT;
+      const pipelineId = process.env.PIPELINE_ID;
+      const errorCode = deriveErrorCode(err);
+      const errorBody = getLastRuntimeLogs() || (err?.message || String(err));
+
+      if (managerFailedEndpoint && pipelineId) {
+        try {
+          await axios.post(
+            managerFailedEndpoint,
+            {
+              pipelineId,
+              runId,
+              errorCode,
+              errorBody,
+            },
+            {
+              headers: { "x-pipeline-key": PIPELINE_AUTH_HEADER },
+            },
+          );
+          console.log(
+            `[SCHED] Reported 'failed' status to manager for runId: ${runId}`,
+          );
+        } catch (reportErr) {
+          console.warn(
+            `[SCHED] Failed to report 'failed' status: ${reportErr.message}`,
+          );
+        }
+      } else {
+        console.warn(
+          `[SCHED] MANAGER_FAILED_ENDPOINT or PIPELINE_ID not set. Skipping 'failed' status report.`,
+        );
+      }
+    }
   } finally {
     running = false;
   }
@@ -2282,32 +2743,71 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 
     // 2) Cron: run at minute 5 of every hour (Asia/Kolkata) so we don't
     //    collide with the other pipeline's 0/10/20/... schedule.
-    cron.schedule(
-      "0 5 * * * *", // second minute hour day month weekday
-      () => safeRun("hourly"),
-      { timezone: "Asia/Kolkata" },
-    );
+    if (SELF_RUN) {
+      cron.schedule(
+        "0 5 * * * *", // second minute hour day month weekday
+        () => safeRun("hourly"),
+        { timezone: "Asia/Kolkata" },
+      );
 
-    console.log(
-      `[SCHED] Cron enabled: runs at minute 5 of every hour (Asia/Kolkata).`,
-    );
+      console.log(
+        `[SCHED] Cron enabled: runs at minute 5 of every hour (Asia/Kolkata).`,
+      );
+    } else {
+      console.log(
+        `[SCHED] SELF_RUN is false; automatic hourly schedule disabled.`,
+      );
+    }
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   }
 
   // Generic Manual Triggering
   const app = express();
   const PORT = process.env.PORT || 8080;
+  app.use(express.json());
 
-  app.post("/run-pipeline", (req, res) => {
-    console.log(`[SERVER] /run-pipeline triggered manually.`);
-    console.log(`[SERVER] Request IP: ${req.ip}`);
+  function getManualRunId(req) {
+    const runId = req.body?.runId;
+    return typeof runId === "string" ? runId.trim() : "";
+  }
 
-    safeRun("manual_http"); // Fire and forget or wait? safeRun handles concurrency.
+  // Authenticated manual trigger
+  app.post("/trigger", (req, res) => {
+    const authKey = req.headers["x-pipeline-key"];
+    if (authKey !== PIPELINE_AUTH_HEADER) {
+      console.warn(`[SERVER] Unauthorized /trigger attempt from IP: ${req.ip}`);
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const runId = getManualRunId(req);
+    if (!runId) {
+      return res.status(400).json({ error: "runId is required" });
+    }
+
+    console.log(`[SERVER] /trigger triggered manually.`);
+    safeRun("manual_http", { runId });
     res.json({
       status: "triggered",
+      runId,
       message: "Pipeline trigger received. Check logs for progress.",
       timestamp: fmtIST(),
     });
+  });
+
+  // Legacy endpoint (now authenticated)
+  app.post("/run-pipeline", (req, res) => {
+    const authKey = req.headers["x-pipeline-key"];
+    if (authKey !== PIPELINE_AUTH_HEADER) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const runId = getManualRunId(req);
+    if (!runId) {
+      return res.status(400).json({ error: "runId is required" });
+    }
+
+    safeRun("manual_http", { runId });
+    res.json({ status: "triggered", runId, timestamp: fmtIST() });
   });
 
   app.listen(PORT, () => {

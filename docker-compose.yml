@@ -17,3 +17,11 @@ services:
       - ./logs:/app/logs
 
     command: node pipeline.js
+
+    networks:
+      - pipeline-net
+
+networks:
+  pipeline-net:
+    name: pipeline-net
+    external: true
