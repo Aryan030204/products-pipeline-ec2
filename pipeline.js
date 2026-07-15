@@ -94,6 +94,24 @@ const HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED =
 const HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS =
   parseInt(process.env.HOURLY_PRODUCT_SESSIONS_RETENTION_DAYS || "7", 10);
 
+// Daily sessions fetch paginates via ShopifyQL LIMIT/OFFSET (a single query is
+// capped at 1000 rows, which truncated the long tail and undercounted per-page
+// sessions). Page size is the per-request LIMIT; max pages is a runaway guard
+// (SHOPIFYQL_MAX_PAGES * SHOPIFYQL_PAGE_SIZE rows). If a page exhausts its
+// retries — or we blow past the page cap — the whole day is skipped.
+const SHOPIFYQL_PAGE_SIZE = Math.max(
+  1,
+  parseInt(process.env.SHOPIFYQL_PAGE_SIZE || "1000", 10) || 1000,
+);
+const SHOPIFYQL_MAX_PAGES = Math.max(
+  1,
+  parseInt(process.env.SHOPIFYQL_MAX_PAGES || "50", 10) || 50,
+);
+const SHOPIFYQL_FETCH_MAX_RETRIES = Math.max(
+  1,
+  parseInt(process.env.SHOPIFYQL_FETCH_MAX_RETRIES || "5", 10) || 5,
+);
+
 // ---------- Concurrency helper ----------
 async function mapWithConcurrency(items, concurrency, mapper) {
   const results = new Array(items.length);
@@ -918,10 +936,27 @@ function buildDayClause(targetYmd) {
   return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
 }
 
-function buildShopifyQLQuery(targetYmd = null) {
+// Thrown when the daily sessions fetch can't be completed (a page exhausted its
+// retries, or pagination ran past the page cap). Callers catch this to skip the
+// whole day instead of persisting a partial/truncated snapshot.
+class ShopifyQLFetchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ShopifyQLFetchError";
+  }
+}
+
+function buildShopifyQLQuery(targetYmd = null, { limit = 1000, offset = 0 } = {}) {
   const dayClause = buildDayClause(targetYmd);
   const tzClause = `WITH TIMEZONE '${SHOPIFYQL_TIMEZONE}'`;
+  const offsetClause = offset > 0 ? ` OFFSET ${offset}` : "";
 
+  // ORDER BY must be a *total, stable* order across page requests, otherwise
+  // OFFSET pagination can skip or repeat rows tied on `sessions`. Sorting by
+  // every GROUP BY dimension after `sessions` makes each grouped row uniquely
+  // positioned, so paging is exact for a static day. (Repeats would be harmless
+  // anyway — the snapshot's UNIQUE(date, dim_hash) upsert overwrites — but gaps
+  // would silently undercount, which is the bug we're fixing.)
   return `
     FROM sessions
       SHOW
@@ -948,55 +983,155 @@ function buildShopifyQLQuery(targetYmd = null) {
         referrer_name
       ${tzClause}
       ${dayClause}
-      ORDER BY sessions DESC
-      LIMIT 1000
+      ORDER BY sessions DESC,
+        landing_page_type ASC,
+        landing_page_path ASC,
+        utm_source ASC,
+        utm_medium ASC,
+        utm_campaign ASC,
+        utm_content ASC,
+        utm_term ASC,
+        referrer_name ASC
+      LIMIT ${limit}${offsetClause}
     VISUALIZE sessions, sessions_with_cart_additions TYPE list_with_dimension_values
   `.replace(/\n+/g, " ");
 }
 
+// Paginates the daily sessions query with LIMIT/OFFSET, accumulating every page.
+// Returns [] for a legitimately empty day; THROWS ShopifyQLFetchError when a page
+// can't be fetched after its retries or when pagination runs past the page cap,
+// so the caller skips the whole day rather than persist a partial snapshot.
 async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
-  const q = buildShopifyQLQuery(targetYmd).replace(/"/g, '\\"');
+  const pageSize = SHOPIFYQL_PAGE_SIZE;
+  const MAX_RETRIES = SHOPIFYQL_FETCH_MAX_RETRIES;
+  const allRows = [];
 
-  const graphql = {
-    query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
-  };
+  for (let page = 0; page < SHOPIFYQL_MAX_PAGES; page++) {
+    const offset = page * pageSize;
+    const q = buildShopifyQLQuery(targetYmd, { limit: pageSize, offset }).replace(
+      /"/g,
+      '\\"',
+    );
+    const graphql = {
+      query: `query { shopifyqlQuery(query: "${q}") { tableData { rows columns { name } } parseErrors } }`,
+    };
 
-  while (true) {
-    const resp = await axios.post(url, graphql, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": brand.accessToken,
-      },
-      timeout: 60000,
-      validateStatus: () => true,
-    });
+    let pageRows = null;
+    let attempt = 1;
+    while (attempt <= MAX_RETRIES) {
+      const resp = await axios.post(url, graphql, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": brand.accessToken,
+        },
+        timeout: 60000,
+        validateStatus: () => true,
+      });
 
-    if (resp.status === 429) {
-      const retry = Number(resp.headers["retry-after"] || "3");
-      console.log(`[${brand.tag}] ShopifyQL rate-limited, sleeping ${retry}s`);
-      await new Promise((r) => setTimeout(r, retry * 1000));
-      continue;
+      if (resp.status === 429) {
+        const retry = Number(resp.headers["retry-after"] || "3");
+        console.log(
+          `[${brand.tag}] ShopifyQL page ${page} (offset ${offset}) rate-limited (429), sleeping ${retry}s (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(retry * 1000);
+        continue; // 429 is not a wasted attempt
+      }
+
+      if (resp.status >= 500) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL page ${page} got ${resp.status}, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (resp.status !== 200) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.error(
+          `[${brand.tag}] ShopifyQL page ${page} failed: HTTP ${resp.status} (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (resp.data?.errors?.length) {
+        const throttleSleepMs = getThrottleResetSleepMsFromGraphQLErrors(
+          resp.data.errors,
+        );
+        if (throttleSleepMs != null) {
+          console.warn(
+            `[${brand.tag}] ShopifyQL page ${page} THROTTLED, sleeping ${Math.ceil(throttleSleepMs / 1000)}s until window reset (attempt ${attempt}/${MAX_RETRIES})`,
+          );
+          await sleep(throttleSleepMs);
+          continue; // Shopify told us exactly when to retry; don't burn an attempt
+        }
+
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL page ${page} GraphQL errors (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(resp.data.errors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      const res = resp.data.data?.shopifyqlQuery;
+      if (!res) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL page ${page} missing shopifyqlQuery payload (HTTP 200), retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES})`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      if (res.parseErrors?.length) {
+        const sleepMs = Math.min(5000, 500 * attempt);
+        console.warn(
+          `[${brand.tag}] ShopifyQL page ${page} parseErrors, retrying in ${sleepMs}ms (attempt ${attempt}/${MAX_RETRIES}): ${JSON.stringify(res.parseErrors)}`,
+        );
+        await sleep(sleepMs);
+        attempt += 1;
+        continue;
+      }
+
+      pageRows = formatShopifyQLTable(res.tableData);
+      break;
     }
 
-    if (resp.status !== 200 || resp.data.errors) {
-      console.error(
-        `[${brand.tag}] ShopifyQL Fetch Failed: ${resp.status}`,
-        resp.data.errors,
+    if (pageRows == null) {
+      // Exhausted retries on this page. Surface a hard failure so the caller
+      // skips the entire day — upserting the partial set we have would let the
+      // snapshot stale-sweep DELETE previously-good tuples from later pages.
+      throw new ShopifyQLFetchError(
+        `[${brand.tag}] ShopifyQL page ${page} (offset ${offset}) failed after ${MAX_RETRIES} attempts for ${targetYmd || "today"}.`,
       );
-      return [];
     }
 
-    const res = resp.data.data?.shopifyqlQuery;
-    if (!res || res.parseErrors?.length) {
-      console.error(`[${brand.tag}] ShopifyQL Parse Errors:`, res?.parseErrors);
-      return [];
+    allRows.push(...pageRows);
+
+    if (pageRows.length < pageSize) {
+      // Short read => this was the last page; we have the complete day.
+      console.log(
+        `[${brand.tag}] ShopifyQL fetched ${allRows.length} rows across ${page + 1} page(s).`,
+      );
+      return allRows;
     }
 
-    const formatted = formatShopifyQLTable(res.tableData);
-    console.log(`[${brand.tag}] ShopifyQL fetched ${formatted.length} rows.`);
-    return formatted;
+    // Full page => there may be more. Small delay to be gentle on rate limits.
+    await sleep(200);
   }
+
+  // Never got a short read within the page cap. Treat as incomplete and skip the
+  // day rather than persist a truncated snapshot.
+  throw new ShopifyQLFetchError(
+    `[${brand.tag}] ShopifyQL exceeded max pages (${SHOPIFYQL_MAX_PAGES} x ${pageSize}) for ${targetYmd || "today"}; aborting day to avoid a truncated snapshot.`,
+  );
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
@@ -2002,8 +2137,24 @@ async function processBrand(brand, targetYmd) {
     );
   }
 
-  // Main sessions snapshot + MVs
-  const rows = await fetchShopifyQLSessions(brand, targetYmd);
+  // Main sessions snapshot + MVs.
+  // The daily fetch paginates via LIMIT/OFFSET. If a page exhausts its retries
+  // (or pagination blows past the page cap) it throws ShopifyQLFetchError, and
+  // we skip the ENTIRE day for this brand — snapshot, MVs, and the hourly steps
+  // below are all left untouched, preserving the previous good data. Caught here
+  // (not propagated) so one brand's bad day can't take down the others.
+  let rows;
+  try {
+    rows = await fetchShopifyQLSessions(brand, targetYmd);
+  } catch (err) {
+    if (err instanceof ShopifyQLFetchError) {
+      console.error(
+        `[${brand.tag}] Skipping ${targetYmd} entirely (snapshot, MVs, and hourly steps left unchanged): ${err.message}`,
+      );
+      return;
+    }
+    throw err;
+  }
   await upsertProductSessionsSnapshot(brand, rows, targetYmd);
   await refreshMaterializedViews(brand, targetYmd);
 
