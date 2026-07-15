@@ -208,6 +208,20 @@ const BACKFILL_END_IST_DATE = (
   process.env.BACKFILL_END_IST ||
   ""
 ).split("T")[0]; // YYYY-MM-DD
+// Rolling backfill window. When > 0, the backfill ignores the fixed START/END
+// dates above and instead refetches each brand's own last N *brand-local* days
+// (end = today in the brand's timezone, start = end - (N-1)). This keeps the
+// window correct for brands in different timezones. Explicit START/END is still
+// used for one-off historical backfills when this is 0/unset.
+const BACKFILL_LOOKBACK_DAYS = Math.max(
+  0,
+  parseInt(process.env.BACKFILL_LOOKBACK_DAYS || "0", 10) || 0,
+);
+// One-shot mode for CI/cron runners: after the backfill completes, exit the
+// process (instead of leaving the HTTP server running). Exit code is always 0 —
+// per-brand/per-day failures are logged and skipped by design, not fatal.
+const EXIT_AFTER_BACKFILL =
+  String(process.env.EXIT_AFTER_BACKFILL || "").toLowerCase().trim() === "true";
 const DEFAULT_SHOPIFYQL_TIMEZONE =
   process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 const TEST_MODE = process.env.TEST_MODE === "true";
@@ -314,6 +328,20 @@ function buildInclusiveDateRangeYMD(startYmd, endYmd) {
     out.push(fmtUTCDateToYMD(cur));
   }
   return out;
+}
+
+// Pure label arithmetic (no timezone involved) — shift a YYYY-MM-DD by `days`.
+function shiftYMD(ymd, days) {
+  return fmtUTCDateToYMD(addDaysUTC(ymdToUTCDate(ymd), days));
+}
+
+// The last N brand-local calendar days, as YYYY-MM-DD labels, inclusive of the
+// brand's "today". These labels are later interpreted in the brand's own
+// timezone by the ShopifyQL WITH TIMEZONE clause.
+function recentDatesForTimeZone(timeZone, lookbackDays) {
+  const end = todayYMDInTimeZone(timeZone);
+  const start = shiftYMD(end, -(lookbackDays - 1));
+  return buildInclusiveDateRangeYMD(start, end);
 }
 
 // ---------- API / Decryption helpers ----------
@@ -2570,9 +2598,37 @@ async function runPipelineForDate(targetYmd) {
 }
 
 async function runBackfillPipeline() {
+  const brands = await getBrands();
+
+  // Rolling mode: each brand refetches its own last N brand-local days, so the
+  // window stays correct even when brands sit in different timezones. Brands run
+  // concurrently; each walks its own date list sequentially.
+  if (BACKFILL_LOOKBACK_DAYS > 0) {
+    console.log(
+      `\n🧱 Backfill mode enabled @ ${fmtIST()} (rolling: last ${BACKFILL_LOOKBACK_DAYS} brand-local day(s) per brand)\n`,
+    );
+    await mapWithConcurrency(brands, BACKFILL_BRAND_CONCURRENCY, async (brand) => {
+      const dates = recentDatesForTimeZone(
+        brand.shopifyQlTimezone,
+        BACKFILL_LOOKBACK_DAYS,
+      );
+      console.log(
+        `[BACKFILL] ${brand.tag} (tz=${brand.shopifyQlTimezone}): ${dates[0]} → ${dates[dates.length - 1]} (${dates.length} day(s))`,
+      );
+      for (const d of dates) {
+        await processBrand(brand, d);
+      }
+    });
+    console.log(
+      `\n🏁 Rolling backfill complete (last ${BACKFILL_LOOKBACK_DAYS} day(s) per brand).\n`,
+    );
+    return;
+  }
+
+  // Explicit historical range: one shared label list handed to every brand.
   if (!BACKFILL_START_IST_DATE || !BACKFILL_END_IST_DATE) {
     throw new Error(
-      `[BACKFILL] BACKFILL_MODE=true requires BACKFILL_START_IST_DATE and BACKFILL_END_IST_DATE`,
+      `[BACKFILL] BACKFILL_MODE=true requires BACKFILL_START_IST_DATE and BACKFILL_END_IST_DATE (or set BACKFILL_LOOKBACK_DAYS for a rolling window)`,
     );
   }
 
@@ -2580,7 +2636,6 @@ async function runBackfillPipeline() {
     BACKFILL_START_IST_DATE,
     BACKFILL_END_IST_DATE,
   );
-  const brands = await getBrands();
 
   console.log(`\n🧱 Backfill mode enabled @ ${fmtIST()}`);
   console.log(
@@ -2722,9 +2777,28 @@ console.log(`[DEBUG] process.argv[1]: ${process.argv[1]}`);
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (BACKFILL_MODE) {
     // Backfill once on startup; do NOT schedule hourly cron
-    safeRun("backfill_startup");
-    console.log(`[SCHED] Backfill mode is ON; cron is disabled.`);
-    console.log(`[SCHED] Service started @ ${fmtIST()}`);
+    if (EXIT_AFTER_BACKFILL) {
+      // One-shot mode for CI/cron runners: run the backfill, then exit the
+      // process. No HTTP server is started (see guard below). Exit code is 0 on
+      // completion — per-brand/per-day failures are logged and skipped, not
+      // fatal — and 1 only if the run promise unexpectedly rejects.
+      console.log(`[SCHED] Backfill one-shot mode; will exit on completion.`);
+      safeRun("backfill_startup")
+        .then(() => {
+          console.log(
+            `[SCHED] Backfill finished; exiting (EXIT_AFTER_BACKFILL) @ ${fmtIST()}`,
+          );
+          process.exit(0);
+        })
+        .catch((err) => {
+          console.error(`[SCHED] Backfill run rejected unexpectedly:`, err);
+          process.exit(1);
+        });
+    } else {
+      safeRun("backfill_startup");
+      console.log(`[SCHED] Backfill mode is ON; cron is disabled.`);
+      console.log(`[SCHED] Service started @ ${fmtIST()}`);
+    }
   } else {
     // 1) Optionally run immediately on deployment/startup.
     //    Default: off — we follow a fixed schedule to avoid colliding with
@@ -2761,7 +2835,10 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     console.log(`[SCHED] Service started @ ${fmtIST()}`);
   }
 
-  // Generic Manual Triggering
+  // Generic Manual Triggering.
+  // Skipped entirely in one-shot backfill mode — that path runs the backfill and
+  // exits, so there's no long-lived process to serve HTTP from.
+  if (!(BACKFILL_MODE && EXIT_AFTER_BACKFILL)) {
   const app = express();
   const PORT = process.env.PORT || 8080;
   app.use(express.json());
@@ -2813,4 +2890,5 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   app.listen(PORT, () => {
     console.log(`[SERVER] HTTP server listening on port ${PORT}`);
   });
+  } // end HTTP-server guard
 }
