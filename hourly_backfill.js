@@ -63,8 +63,24 @@ function buildInclusiveDateRangeYMD(startYmd, endYmd) {
 function loadBrands() {
   const count = parseInt(process.env.TOTAL_CONFIG_COUNT || "0", 10);
   const brands = [];
+  let inactiveCount = 0;
+
+  console.log(`[INIT] Loading ${count} backfill brand configs...`);
 
   for (let i = 0; i < count; i++) {
+    const activeBrandTag = process.env[`BRAND_TAG_${i}`] || `brand_${i}`;
+    const activeBrandName =
+      process.env[`BRAND_NAME_${i}`] || activeBrandTag.toUpperCase();
+    const isActive = process.env[`IS_ACTIVE_${i}`] === "true";
+
+    if (!isActive) {
+      console.log(
+        `[INIT] Skipping brand ${activeBrandName} (index ${i}) - IS_ACTIVE_${i} is not true.`
+      );
+      inactiveCount++;
+      continue;
+    }
+
     const shopName = process.env[`SHOP_NAME_${i}`];
     const apiVersion = process.env[`API_VERSION_${i}`];
     const accessToken = process.env[`ACCESS_TOKEN_${i}`];
@@ -136,6 +152,7 @@ function loadBrands() {
     });
   }
 
+  console.log(`[INIT] Inactive backfill brands skipped: ${inactiveCount}`);
   console.log(`[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`);
   return brands;
 }

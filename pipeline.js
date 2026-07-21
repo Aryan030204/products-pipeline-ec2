@@ -612,6 +612,7 @@ async function loadBrands() {
 
   const brands = [];
   let index = 0;
+  let inactiveCount = 0;
 
   for (const strId of brandIds) {
     const id = parseInt(strId, 10);
@@ -626,6 +627,16 @@ async function loadBrands() {
         `[INIT] Failed to fetch credentials for brand ID ${id}:`,
         err.message,
       );
+      continue;
+    }
+
+    if (brandData?.is_active !== true) {
+      const brandLabel =
+        brandData?.brand_name || brandData?.brand_tag || `brand_id_${id}`;
+      console.log(
+        `[INIT] Skipping brand ${brandLabel} (ID ${id}) - is_active is not true.`,
+      );
+      inactiveCount++;
       continue;
     }
 
@@ -740,6 +751,7 @@ async function loadBrands() {
     index++;
   }
 
+  console.log(`[INIT] Inactive brands skipped: ${inactiveCount}`);
   console.log(
     `[INIT] Active brands: ${brands.map((b) => `${b.index}:${b.name}`).join(", ")}`,
   );
