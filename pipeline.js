@@ -26,6 +26,20 @@ import fs from "fs";
 import express from "express";
 import { pathToFileURL } from "url";
 import crypto from "crypto";
+import {
+  todayYMDInTimeZone,
+  sleep,
+  formatShopifyQLTable,
+  buildDayClause,
+  ShopifyQLFetchError,
+  getThrottleResetSleepMsFromGraphQLErrors,
+} from "./shopifyql_utils.js";
+import {
+  ensureProductTypeSalesTables,
+  fetchProductTypeSales,
+  upsertProductTypeSalesSnapshot,
+  refreshProductTypeFunnelRollup,
+} from "./product_type_sales.js";
 
 // ---------- Runtime log capture (last 2 lines) ----------
 const RUNTIME_LOG_LIMIT = 2;
@@ -171,26 +185,52 @@ function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
   return DEFAULT_SHOPIFYQL_TIMEZONE;
 }
 
-function getDatePartsInTimeZone(timeZone, date = new Date()) {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts = formatter.formatToParts(date);
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+function parseBrandIndexList(rawValue) {
+  if (!rawValue) return null;
 
-  return {
-    year: values.year,
-    month: values.month,
-    day: values.day,
-  };
+  const unique = new Set();
+  for (const part of rawValue.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (!/^\d+$/.test(trimmed)) {
+      throw new Error(
+        `[BACKFILL] Invalid BACKFILL_BRAND_INDICES="${rawValue}". Expected a comma-separated list of non-negative integers.`,
+      );
+    }
+    unique.add(parseInt(trimmed, 10));
+  }
+
+  return unique;
 }
 
-function todayYMDInTimeZone(timeZone) {
-  const { year, month, day } = getDatePartsInTimeZone(timeZone);
-  return `${year}-${month}-${day}`;
+function selectBackfillBrands(brands) {
+  const selectedIndices = parseBrandIndexList(BACKFILL_BRAND_INDICES);
+  if (!selectedIndices || selectedIndices.size === 0) {
+    return brands;
+  }
+
+  const filteredBrands = brands.filter((brand) => selectedIndices.has(brand.index));
+  if (!filteredBrands.length) {
+    throw new Error(
+      `[BACKFILL] BACKFILL_BRAND_INDICES="${BACKFILL_BRAND_INDICES}" matched no active brands. Active brand indices: ${brands.map((brand) => brand.index).join(", ") || "none"}`,
+    );
+  }
+
+  const availableIndices = new Set(filteredBrands.map((brand) => brand.index));
+  const missingIndices = [...selectedIndices].filter(
+    (index) => !availableIndices.has(index),
+  );
+
+  console.log(
+    `[BACKFILL] Brand filter enabled via BACKFILL_BRAND_INDICES=${BACKFILL_BRAND_INDICES}. Selected brands: ${filteredBrands.map((brand) => `${brand.index}:${brand.name}`).join(", ")}`,
+  );
+  if (missingIndices.length) {
+    console.warn(
+      `[BACKFILL] Ignoring requested brand indices with no active match: ${missingIndices.join(", ")}`,
+    );
+  }
+
+  return filteredBrands;
 }
 
 // ---------- Backfill env ----------
@@ -208,6 +248,9 @@ const BACKFILL_END_IST_DATE = (
   process.env.BACKFILL_END_IST ||
   ""
 ).split("T")[0]; // YYYY-MM-DD
+const BACKFILL_BRAND_INDICES = String(
+  process.env.BACKFILL_BRAND_INDICES || "",
+).trim();
 // Rolling backfill window. When > 0, the backfill ignores the fixed START/END
 // dates above and instead refetches each brand's own last N *brand-local* days
 // (end = today in the brand's timezone, start = end - (N-1)). This keeps the
@@ -1316,48 +1359,8 @@ async function syncProductsForBrand(brand) {
 }
 
 // ---------- ShopifyQL helpers ----------
-function formatShopifyQLTable(tableData) {
-  const columns = tableData.columns || [];
-  const rows = tableData.rows || [];
-  const out = [];
-
-  for (const row of rows) {
-    // NEW STYLE (object rows)
-    if (row && typeof row === "object" && !Array.isArray(row)) {
-      out.push({ ...row });
-      continue;
-    }
-
-    // LEGACY STYLE (array rows)
-    if (Array.isArray(row)) {
-      const obj = {};
-      row.forEach((val, idx) => {
-        if (columns[idx]) obj[columns[idx].name] = val;
-      });
-      out.push(obj);
-    }
-  }
-
-  return out;
-}
-
-function buildDayClause(targetYmd, timeZone = DEFAULT_SHOPIFYQL_TIMEZONE) {
-  // Avoid "future UNTIL" for today; use DURING today for current day runs.
-  if (!targetYmd || targetYmd === todayYMDInTimeZone(timeZone)) {
-    return `DURING today`;
-  }
-  return `SINCE ${targetYmd}T00:00:00 UNTIL ${targetYmd}T23:59:59`;
-}
-
-// Thrown when the daily sessions fetch can't be completed (a page exhausted its
-// retries, or pagination ran past the page cap). Callers catch this to skip the
-// whole day instead of persisting a partial/truncated snapshot.
-class ShopifyQLFetchError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "ShopifyQLFetchError";
-  }
-}
+// (formatShopifyQLTable, buildDayClause, ShopifyQLFetchError now live in
+// shopifyql_utils.js, shared with product_type_sales.js)
 
 function buildShopifyQLQuery(
   brand,
@@ -1612,25 +1615,6 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
 function buildHourClause(targetYmd, hour) {
   const hh = String(hour).padStart(2, "0");
   return `SINCE ${targetYmd}T${hh}:00:00 UNTIL ${targetYmd}T${hh}:59:59`;
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function getThrottleResetSleepMsFromGraphQLErrors(errors) {
-  if (!Array.isArray(errors) || !errors.length) return null;
-
-  const throttled = errors.find(
-    (e) => e?.extensions?.code === "THROTTLED" && e?.extensions?.cost?.windowResetAt,
-  );
-  if (!throttled) return null;
-
-  const resetAt = Date.parse(throttled.extensions.cost.windowResetAt);
-  if (!Number.isFinite(resetAt)) return null;
-
-  // Add a small buffer so we don't wake up exactly on the boundary.
-  return Math.max(0, resetAt - Date.now()) + 250;
 }
 
 function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
@@ -2578,6 +2562,25 @@ async function processBrand(brand, requestedTargetYmd) {
   await upsertProductSessionsSnapshot(brand, rows, targetYmd);
   await refreshMaterializedViews(brand, targetYmd);
 
+  // Product-type sales/orders (from Shopify's `sales` ShopifyQL report) +
+  // funnel rollup joining it with the session-by-type MV just refreshed above.
+  // Additive metric — a failure here is logged and skipped, not fatal to the
+  // rest of the day (unlike the main sessions fetch above).
+  await ensureProductTypeSalesTables(brand);
+  try {
+    const salesRows = await fetchProductTypeSales(brand, targetYmd);
+    await upsertProductTypeSalesSnapshot(brand, salesRows, targetYmd);
+    await refreshProductTypeFunnelRollup(brand, targetYmd);
+  } catch (err) {
+    if (err instanceof ShopifyQLFetchError) {
+      console.error(
+        `[${brand.tag}] Skipping product-type sales for ${targetYmd}: ${err.message}`,
+      );
+    } else {
+      throw err;
+    }
+  }
+
   // Hourly summary
   const hourly = await fetchShopifyQLHourlySessions(brand, targetYmd);
   await upsertHourlySessionsSummary(brand, hourly, targetYmd);
@@ -2610,7 +2613,7 @@ async function runPipelineForDate(targetYmd) {
 }
 
 async function runBackfillPipeline() {
-  const brands = await getBrands();
+  const brands = selectBackfillBrands(await getBrands());
 
   // Rolling mode: each brand refetches its own last N brand-local days, so the
   // window stays correct even when brands sit in different timezones. Brands run
