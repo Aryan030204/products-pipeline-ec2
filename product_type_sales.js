@@ -67,13 +67,15 @@ export async function ensureProductTypeSalesTables(brand) {
 // ---------- Fetch ----------
 function buildProductTypeSalesQuery(brand, targetYmd) {
   const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
-  const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
+  // ShopifyQL only allows a single WITH clause per query — GROUP_TOTALS/TOTALS
+  // and TIMEZONE must be combined into one, not issued as two separate WITHs.
+  const withClause = `WITH GROUP_TOTALS, TOTALS, TIMEZONE '${brand.shopifyQlTimezone}'`;
 
   return `
     FROM sales
       SHOW net_sales, gross_sales, orders
-      GROUP BY product_type, day WITH GROUP_TOTALS, TOTALS
-      ${tzClause}
+      GROUP BY product_type, day
+      ${withClause}
       ${dayClause}
       ORDER BY net_sales__product_type_totals DESC, day ASC, net_sales DESC,
         product_type ASC
