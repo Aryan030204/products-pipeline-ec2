@@ -203,7 +203,7 @@ function parseBrandIndexList(rawValue) {
   return unique;
 }
 
-function selectBackfillBrands(brands) {
+export function selectBackfillBrands(brands) {
   const selectedIndices = parseBrandIndexList(BACKFILL_BRAND_INDICES);
   if (!selectedIndices || selectedIndices.size === 0) {
     return brands;
@@ -304,7 +304,7 @@ const SHOPIFYQL_FETCH_MAX_RETRIES = Math.max(
 );
 
 // ---------- Concurrency helper ----------
-async function mapWithConcurrency(items, concurrency, mapper) {
+export async function mapWithConcurrency(items, concurrency, mapper) {
   const results = new Array(items.length);
   let nextIndex = 0;
 
@@ -346,7 +346,7 @@ function addDaysUTC(dt, days) {
   return new Date(dt.getTime() + days * 86400000);
 }
 
-function buildInclusiveDateRangeYMD(startYmd, endYmd) {
+export function buildInclusiveDateRangeYMD(startYmd, endYmd) {
   if (!isValidYMD(startYmd) || !isValidYMD(endYmd)) {
     throw new Error(
       `[BACKFILL] Invalid date format. Expected YYYY-MM-DD for BACKFILL_START_IST_DATE/BACKFILL_END_IST_DATE. Got start=${startYmd}, end=${endYmd}`,
@@ -381,7 +381,7 @@ function shiftYMD(ymd, days) {
 // The last N brand-local calendar days, as YYYY-MM-DD labels, inclusive of the
 // brand's "today". These labels are later interpreted in the brand's own
 // timezone by the ShopifyQL WITH TIMEZONE clause.
-function recentDatesForTimeZone(timeZone, lookbackDays) {
+export function recentDatesForTimeZone(timeZone, lookbackDays) {
   const end = todayYMDInTimeZone(timeZone);
   const start = shiftYMD(end, -(lookbackDays - 1));
   return buildInclusiveDateRangeYMD(start, end);
@@ -831,7 +831,7 @@ async function loadBrands() {
 
 // Reuse pools across runs
 let _BRANDS = null;
-async function getBrands() {
+export async function getBrands() {
   if (!_BRANDS) _BRANDS = await loadBrands();
   return _BRANDS;
 }
@@ -873,7 +873,7 @@ const DIM_HASH_EXPR = `UNHEX(SHA1(CONCAT_WS('|',
 const PATH_NORM_EXPR = `IF(landing_page_path='/', '/', TRIM(TRAILING '/' FROM landing_page_path))`;
 
 // ---------- DB Setup ----------
-async function ensureTablesForBrand(brand) {
+export async function ensureTablesForBrand(brand) {
   if (brand._tablesEnsured) return;
 
   const conn = await brand.pool.getConnection();
