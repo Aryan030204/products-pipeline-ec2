@@ -3,9 +3,12 @@ name: Products Pipeline – rolling backfill
 # Runs the product sessions pipeline as a one-shot backfill that refetches each
 # brand's last N brand-local days (default 2), then exits.
 #
-# Schedule: 12:10 IST == 06:40 UTC. GitHub cron is UTC-only, and "*/2" on the
-# day-of-month runs on days 1,3,5,…,31 then 1 — the standard "every 2 days"
-# approximation (a 1-day gap straddles each month boundary).
+# The recurring `schedule:` trigger that used to live here has moved to Docker
+# — see docker-compose.yml's `products-pipeline-backfill` service, which runs
+# this same pipeline.js in the same BACKFILL_MODE on an internal cron
+# (backfill-cron-entrypoint.sh) at the identical UTC time this workflow used
+# to fire. This workflow is kept only as a manual (workflow_dispatch) fallback
+# so it can still be run by hand from the Actions tab if ever needed.
 #
 # Requires these repo secrets (Settings → Secrets and variables → Actions):
 #   GET_BRANDS_API, PIPELINE_AUTH_HEADER, PASSWORD_AES_KEY
@@ -14,8 +17,6 @@ name: Products Pipeline – rolling backfill
 #   HOURLY_PRODUCT_SESSIONS_ENABLED, HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED
 
 on:
-  schedule:
-    - cron: "40 6 */2 * *" # 12:10 IST (06:40 UTC), every 2nd day-of-month
   workflow_dispatch:
     inputs:
       lookback_days:

@@ -21,6 +21,48 @@ services:
     networks:
       - pipeline-net
 
+  # Retrospective/rolling backfill worker — replaces the GitHub Actions
+  # schedule in .github/workflows/products-pipeline-backfill.yml. Same image,
+  # same pipeline.js, same env values the workflow used; only the trigger
+  # (crond in this container instead of GitHub's scheduler) changed.
+  #
+  # Deliberately does NOT use `env_file: .env` — that file carries mutable,
+  # ad-hoc values (BACKFILL_BRAND_INDICES, BACKFILL_START_IST/END_IST, etc.)
+  # meant for one-off manual backfill runs of the OTHER service. This worker
+  # must always run for every active brand over exactly a 2-day rolling
+  # window, matching the old workflow, regardless of what .env is set to for
+  # manual testing — so it only pulls the 3 required credentials by name and
+  # hardcodes everything else.
+  products-pipeline-backfill:
+
+    build: .
+
+    container_name: products-pipeline-backfill
+
+    restart: always
+
+    environment:
+      BACKFILL_MODE: "true"
+      BACKFILL_LOOKBACK_DAYS: "2"
+      EXIT_AFTER_BACKFILL: "true"
+      SELF_RUN: "false"
+      BACKFILL_BRAND_CONCURRENCY: "3"
+      SHOPIFYQL_TIMEZONE: "Asia/Kolkata"
+      HOURLY_PRODUCT_SESSIONS_ENABLED: "true"
+      HOURLY_PRODUCT_SESSIONS_BACKFILL_ENABLED: "false"
+      DB_SSL_ENABLED: "${DB_SSL_ENABLED:-}"
+      GET_BRANDS_API: "${GET_BRANDS_API}"
+      PIPELINE_AUTH_HEADER: "${PIPELINE_AUTH_HEADER}"
+      PASSWORD_AES_KEY: "${PASSWORD_AES_KEY}"
+
+    volumes:
+      - ./logs:/app/logs
+
+    entrypoint: ["sh", "/app/backfill-cron-entrypoint.sh"]
+
+    networks:
+      - pipeline-net
+
 networks:
   pipeline-net:
     name: pipeline-net
