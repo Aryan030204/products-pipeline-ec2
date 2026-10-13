@@ -2,4 +2,4 @@
 venv
 _pycache
 .env.local
-node_modules
+node_modulestest-results

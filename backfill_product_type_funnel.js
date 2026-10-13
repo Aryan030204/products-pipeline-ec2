@@ -68,7 +68,7 @@ const BACKFILL_BRAND_CONCURRENCY = Math.max(
   parseInt(process.env.BACKFILL_BRAND_CONCURRENCY || "2", 10) || 2,
 );
 
-async function processBrandDate(brand, targetYmd) {
+export async function processBrandDate(brand, targetYmd) {
   await ensureTablesForBrand(brand); // mv_product_sessions_by_type_daily lives here
   await ensureProductTypeSalesTables(brand);
 
@@ -87,7 +87,7 @@ async function processBrandDate(brand, targetYmd) {
   }
 }
 
-async function run() {
+export async function run() {
   const brands = selectBackfillBrands(await getBrands());
   if (!brands.length) {
     console.log(`[FUNNEL-BACKFILL] No active brands to process.`);

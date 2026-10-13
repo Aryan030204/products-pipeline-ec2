@@ -5,7 +5,8 @@
   "main": "pipeline.js",
   "type": "module",
   "scripts": {
-    "start": "node pipeline.js"
+    "start": "node pipeline.js",
+    "test": "node --test test/*.test.js"
   },
   "author": "",
   "license": "ISC",

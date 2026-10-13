@@ -45,7 +45,7 @@ import {
 const RUNTIME_LOG_LIMIT = 2;
 const runtimeLogs = [];
 
-function formatLogArg(arg) {
+export function formatLogArg(arg) {
   if (typeof arg === "string") return arg;
   if (arg instanceof Error) return arg.stack || arg.message || String(arg);
   try {
@@ -55,7 +55,7 @@ function formatLogArg(arg) {
   }
 }
 
-function pushRuntimeLog(level, args) {
+export function pushRuntimeLog(level, args) {
   const line = `[${level}] ${args.map(formatLogArg).join(" ")}`.trim();
   if (!line) return;
   runtimeLogs.push(line);
@@ -83,11 +83,11 @@ console.error = (...args) => {
   baseConsole.error(...args);
 };
 
-function getLastRuntimeLogs() {
+export function getLastRuntimeLogs() {
   return runtimeLogs.slice(-RUNTIME_LOG_LIMIT).join("\n");
 }
 
-function normalizeErrorCode(value) {
+export function normalizeErrorCode(value) {
   const normalized = String(value || "")
     .replace(/[^a-z0-9]+/gi, "_")
     .replace(/^_+|_+$/g, "")
@@ -95,7 +95,7 @@ function normalizeErrorCode(value) {
   return normalized || "UNKNOWN_ERROR";
 }
 
-function deriveErrorCode(err) {
+export function deriveErrorCode(err) {
   const code = err?.code || err?.name || "Error";
   const message = String(err?.message || "");
   const combined = `${code} ${message}`.toLowerCase();
@@ -117,13 +117,13 @@ function deriveErrorCode(err) {
 // ---------- Time helpers ----------
 const IST_OFFSET_MIN = 330; // +05:30
 
-function nowIST() {
+export function nowIST() {
   const now = new Date();
   const utc = now.getTime() + now.getTimezoneOffset() * 60000;
   return new Date(utc + IST_OFFSET_MIN * 60000);
 }
 
-function fmtIST() {
+export function fmtIST() {
   const d = nowIST();
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
@@ -134,23 +134,23 @@ function fmtIST() {
   return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+05:30`;
 }
 
-function todayISTDate() {
+export function todayISTDate() {
   const d = nowIST();
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
 
-function fmtDate(d) {
+export function fmtDate(d) {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function todayISTYMD() {
+export function todayISTYMD() {
   return fmtDate(todayISTDate());
 }
 
-function isValidTimeZone(timeZone) {
+export function isValidTimeZone(timeZone) {
   if (!timeZone) return false;
   try {
     Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
@@ -160,7 +160,7 @@ function isValidTimeZone(timeZone) {
   }
 }
 
-function extractIanaTimeZone(storeTimezoneValue) {
+export function extractIanaTimeZone(storeTimezoneValue) {
   const raw = String(storeTimezoneValue || "").trim();
   if (!raw) return null;
   if (isValidTimeZone(raw)) return raw;
@@ -172,7 +172,7 @@ function extractIanaTimeZone(storeTimezoneValue) {
   return isValidTimeZone(candidate) ? candidate : null;
 }
 
-function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
+export function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
   const parsed = extractIanaTimeZone(storeTimezoneValue);
   if (parsed) return parsed;
 
@@ -185,7 +185,7 @@ function resolveBrandTimeZone(storeTimezoneValue, brandName = "unknown") {
   return DEFAULT_SHOPIFYQL_TIMEZONE;
 }
 
-function parseBrandIndexList(rawValue) {
+export function parseBrandIndexList(rawValue) {
   if (!rawValue) return null;
 
   const unique = new Set();
@@ -326,23 +326,23 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
 }
 
 // ---------- Date-range helpers (safe iteration using UTC) ----------
-function isValidYMD(s) {
+export function isValidYMD(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
-function ymdToUTCDate(ymd) {
+export function ymdToUTCDate(ymd) {
   const [y, m, d] = ymd.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d));
 }
 
-function fmtUTCDateToYMD(dt) {
+export function fmtUTCDateToYMD(dt) {
   const y = dt.getUTCFullYear();
   const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
   const d = String(dt.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
 
-function addDaysUTC(dt, days) {
+export function addDaysUTC(dt, days) {
   return new Date(dt.getTime() + days * 86400000);
 }
 
@@ -374,7 +374,7 @@ export function buildInclusiveDateRangeYMD(startYmd, endYmd) {
 }
 
 // Pure label arithmetic (no timezone involved) — shift a YYYY-MM-DD by `days`.
-function shiftYMD(ymd, days) {
+export function shiftYMD(ymd, days) {
   return fmtUTCDateToYMD(addDaysUTC(ymdToUTCDate(ymd), days));
 }
 
@@ -393,7 +393,7 @@ const PIPELINE_AUTH_HEADER = process.env.PIPELINE_AUTH_HEADER;
 const PASSWORD_AES_KEY = process.env.PASSWORD_AES_KEY;
 const API_HEADERS = { "x-pipeline-key": PIPELINE_AUTH_HEADER };
 
-function normalizeKey(rawKey) {
+export function normalizeKey(rawKey) {
   let buf = Buffer.from(rawKey, "utf8");
   if (buf.length < 32) {
     const padded = Buffer.alloc(32); // zero-filled
@@ -405,7 +405,7 @@ function normalizeKey(rawKey) {
   return buf;
 }
 
-function decryptAES(encryptedValue) {
+export function decryptAES(encryptedValue) {
   if (!encryptedValue) return encryptedValue;
   if (!encryptedValue.includes(":")) return encryptedValue;
 
@@ -425,7 +425,7 @@ function decryptAES(encryptedValue) {
   }
 }
 
-function decryptAESMaybe(encryptedValue) {
+export function decryptAESMaybe(encryptedValue) {
   if (!encryptedValue) return encryptedValue;
   if (!encryptedValue.includes(":")) return encryptedValue;
   if (!PASSWORD_AES_KEY) {
@@ -436,21 +436,21 @@ function decryptAESMaybe(encryptedValue) {
   return decryptAES(encryptedValue);
 }
 
-function pickField(obj, keys) {
+export function pickField(obj, keys) {
   for (const key of keys) {
     if (obj[key] !== undefined && obj[key] !== null) return obj[key];
   }
   return undefined;
 }
 
-function parseCsv(value) {
+export function parseCsv(value) {
   return String(value || "")
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
 }
 
-function buildBrandListFromIndexedEnv(envLocal) {
+export function buildBrandListFromIndexedEnv(envLocal) {
   const explicitIndexes = new Set(
     Object.keys(envLocal)
       .map((key) =>
@@ -484,7 +484,7 @@ function buildBrandListFromIndexedEnv(envLocal) {
     }));
 }
 
-async function loadBrandsFromEnvLocal() {
+export async function loadBrandsFromEnvLocal() {
   const envLocalPath = new URL(".env.local", import.meta.url);
   if (!fs.existsSync(envLocalPath)) {
     console.error("[INIT] TEST_MODE is true but .env.local was not found.");
@@ -655,7 +655,7 @@ async function loadBrandsFromEnvLocal() {
 }
 
 // ---------- Brand config ----------
-async function loadBrands() {
+export async function loadBrands() {
   if (TEST_MODE) {
     return loadBrandsFromEnvLocal();
   }
@@ -836,7 +836,7 @@ export async function getBrands() {
   return _BRANDS;
 }
 
-async function ensureIndex(conn, tableName, indexName, addIndexSql) {
+export async function ensureIndex(conn, tableName, indexName, addIndexSql) {
   const [rows] = await conn.query(`SHOW INDEX FROM ?? WHERE Key_name = ?`, [
     tableName,
     indexName,
@@ -846,7 +846,7 @@ async function ensureIndex(conn, tableName, indexName, addIndexSql) {
   }
 }
 
-async function ensureColumn(conn, tableName, columnName, addColumnSql) {
+export async function ensureColumn(conn, tableName, columnName, addColumnSql) {
   const [rows] = await conn.query(`SHOW COLUMNS FROM ?? LIKE ?`, [
     tableName,
     columnName,
@@ -1237,7 +1237,7 @@ export async function ensureTablesForBrand(brand) {
 }
 
 // ---------- Metadata helpers ----------
-async function getLastProductSyncDate(brand) {
+export async function getLastProductSyncDate(brand) {
   const conn = await brand.pool.getConnection();
   try {
     const [rows] = await conn.query(
@@ -1250,7 +1250,7 @@ async function getLastProductSyncDate(brand) {
   }
 }
 
-async function setLastProductSyncDate(brand, dateStr) {
+export async function setLastProductSyncDate(brand, dateStr) {
   const conn = await brand.pool.getConnection();
   try {
     await conn.query(
@@ -1267,7 +1267,7 @@ async function setLastProductSyncDate(brand, dateStr) {
 }
 
 // ---------- Product sync (patched pagination) ----------
-async function syncProductsForBrand(brand) {
+export async function syncProductsForBrand(brand) {
   console.log(`[${brand.tag}] Running daily product sync...`);
 
   const conn = await brand.pool.getConnection();
@@ -1362,7 +1362,7 @@ async function syncProductsForBrand(brand) {
 // (formatShopifyQLTable, buildDayClause, ShopifyQLFetchError now live in
 // shopifyql_utils.js, shared with product_type_sales.js)
 
-function buildShopifyQLQuery(
+export function buildShopifyQLQuery(
   brand,
   targetYmd = null,
   { limit = 1000, offset = 0 } = {},
@@ -1421,7 +1421,7 @@ function buildShopifyQLQuery(
 // Returns [] for a legitimately empty day; THROWS ShopifyQLFetchError when a page
 // can't be fetched after its retries or when pagination runs past the page cap,
 // so the caller skips the whole day rather than persist a partial snapshot.
-async function fetchShopifyQLSessions(brand, targetYmd = null) {
+export async function fetchShopifyQLSessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
   const pageSize = SHOPIFYQL_PAGE_SIZE;
   const MAX_RETRIES = SHOPIFYQL_FETCH_MAX_RETRIES;
@@ -1555,7 +1555,7 @@ async function fetchShopifyQLSessions(brand, targetYmd = null) {
 }
 
 // ---------- Hourly ShopifyQL (hour_of_day) ----------
-function buildShopifyQLHourlyQuery(brand, targetYmd = null) {
+export function buildShopifyQLHourlyQuery(brand, targetYmd = null) {
   const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
   const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
@@ -1575,7 +1575,7 @@ function buildShopifyQLHourlyQuery(brand, targetYmd = null) {
   `.replace(/\n+/g, " ");
 }
 
-async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
+export async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
   const q = buildShopifyQLHourlyQuery(brand, targetYmd).replace(/"/g, '\\"');
 
@@ -1612,12 +1612,12 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd = null) {
 }
 
 // ---------- Hourly Dimension ShopifyQL (per-hour time slices with full dimensions) ----------
-function buildHourClause(targetYmd, hour) {
+export function buildHourClause(targetYmd, hour) {
   const hh = String(hour).padStart(2, "0");
   return `SINCE ${targetYmd}T${hh}:00:00 UNTIL ${targetYmd}T${hh}:59:59`;
 }
 
-function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
+export function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
   const dayClause = buildDayClause(targetYmd, brand.shopifyQlTimezone);
   const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
@@ -1655,7 +1655,7 @@ function buildShopifyQLHourlyDimensionAllHoursQuery(brand, targetYmd) {
   `.replace(/\n+/g, " ");
 }
 
-function buildShopifyQLHourlyDimensionQuery(brand, targetYmd, hour) {
+export function buildShopifyQLHourlyDimensionQuery(brand, targetYmd, hour) {
   const hourClause = buildHourClause(targetYmd, hour);
   const tzClause = `WITH TIMEZONE '${brand.shopifyQlTimezone}'`;
 
@@ -1691,7 +1691,7 @@ function buildShopifyQLHourlyDimensionQuery(brand, targetYmd, hour) {
   `.replace(/\n+/g, " ");
 }
 
-async function fetchHourlyDimensionSessions(brand, targetYmd) {
+export async function fetchHourlyDimensionSessions(brand, targetYmd) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/${brand.apiVersion}/graphql.json`;
   const allRows = [];
   const hourRowCounts = new Map();
@@ -1973,7 +1973,7 @@ async function fetchHourlyDimensionSessions(brand, targetYmd) {
 }
 
 // ---------- Snapshot + MV refresh ----------
-async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
+export async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
@@ -2061,7 +2061,7 @@ async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
   }
 }
 
-async function refreshMaterializedViews(brand, targetYmd) {
+export async function refreshMaterializedViews(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
 
   try {
@@ -2256,7 +2256,7 @@ async function refreshMaterializedViews(brand, targetYmd) {
 }
 
 // ---------- Hourly summary upsert ----------
-async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
+export async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
     const byHour = new Map();
@@ -2297,7 +2297,7 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
 }
 
 // ---------- Hourly product sessions upsert (full dimensions) ----------
-async function upsertHourlyProductSessions(brand, rows, targetYmd) {
+export async function upsertHourlyProductSessions(brand, rows, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
     if (!rows.length) {
@@ -2381,7 +2381,7 @@ async function upsertHourlyProductSessions(brand, rows, targetYmd) {
   }
 }
 
-async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
+export async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
     const [[{ run_started_at: runStartedAt }]] = await conn.query(
@@ -2519,7 +2519,7 @@ async function upsertHourlyProductPerformanceRollup(brand, targetYmd) {
 }
 
 // ---------- Pipeline per brand (date-aware) ----------
-async function processBrand(brand, requestedTargetYmd) {
+export async function processBrand(brand, requestedTargetYmd) {
   const targetYmd = requestedTargetYmd || todayYMDInTimeZone(brand.shopifyQlTimezone);
   const startTotal = Date.now();
   console.log(
@@ -2601,7 +2601,7 @@ async function processBrand(brand, requestedTargetYmd) {
 }
 
 // ---------- Runners ----------
-async function runPipelineForDate(targetYmd) {
+export async function runPipelineForDate(targetYmd) {
   const brands = await getBrands();
   console.log(
     `\n🚀 Product Sessions Pipeline @ ${fmtIST()} (target=${targetYmd || "brand-local today"}) | brand concurrency=${HOURLY_BRAND_CONCURRENCY}/${brands.length}\n`,
@@ -2612,7 +2612,7 @@ async function runPipelineForDate(targetYmd) {
   console.log(`\n✅ All brands completed for ${targetYmd || "brand-local today"}.\n`);
 }
 
-async function runBackfillPipeline() {
+export async function runBackfillPipeline() {
   const brands = selectBackfillBrands(await getBrands());
 
   // Rolling mode: each brand refetches its own last N brand-local days, so the
@@ -2677,7 +2677,7 @@ async function runBackfillPipeline() {
 // ---------- Scheduler wrapper ----------
 let running = false;
 
-async function safeRun(trigger = "unknown", options = {}) {
+export async function safeRun(trigger = "unknown", options = {}) {
   if (running) {
     console.log(
       `[SCHED] Skipping run (${trigger}) because previous run is still running.`,

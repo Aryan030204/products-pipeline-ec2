@@ -28,23 +28,23 @@ const END = process.env.HOURLY_BACKFILL_END_IST_DATE;
 const SHOPIFYQL_TIMEZONE = process.env.SHOPIFYQL_TIMEZONE || "Asia/Kolkata";
 
 // ---------- date helpers (UTC-safe iteration for YYYY-MM-DD lists) ----------
-function isValidYMD(s) {
+export function isValidYMD(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
-function ymdToUTCDate(ymd) {
+export function ymdToUTCDate(ymd) {
   const [y, m, d] = ymd.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d));
 }
-function fmtUTCDateToYMD(dt) {
+export function fmtUTCDateToYMD(dt) {
   const y = dt.getUTCFullYear();
   const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
   const d = String(dt.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
-function addDaysUTC(dt, days) {
+export function addDaysUTC(dt, days) {
   return new Date(dt.getTime() + days * 86400000);
 }
-function buildInclusiveDateRangeYMD(startYmd, endYmd) {
+export function buildInclusiveDateRangeYMD(startYmd, endYmd) {
   if (!isValidYMD(startYmd) || !isValidYMD(endYmd)) {
     throw new Error(`[HOURLY] Invalid date format. Use YYYY-MM-DD. start=${startYmd}, end=${endYmd}`);
   }
@@ -60,7 +60,7 @@ function buildInclusiveDateRangeYMD(startYmd, endYmd) {
 }
 
 // ---------- brand config ----------
-function loadBrands() {
+export function loadBrands() {
   const count = parseInt(process.env.TOTAL_CONFIG_COUNT || "0", 10);
   const brands = [];
   let inactiveCount = 0;
@@ -158,7 +158,7 @@ function loadBrands() {
 }
 
 // ---------- ensure hourly table ----------
-async function ensureHourlyTable(brand) {
+export async function ensureHourlyTable(brand) {
   const conn = await brand.pool.getConnection();
   try {
     await conn.query(`
@@ -178,7 +178,7 @@ async function ensureHourlyTable(brand) {
 }
 
 // ---------- ShopifyQL hourly ----------
-function buildShopifyQLHourlyQuery(targetYmd) {
+export function buildShopifyQLHourlyQuery(targetYmd) {
   return `
     FROM sessions
       SHOW hour_of_day, sessions, sessions_with_cart_additions
@@ -192,7 +192,7 @@ function buildShopifyQLHourlyQuery(targetYmd) {
   `.replace(/\n+/g, " ");
 }
 
-function formatShopifyQLTable(tableData) {
+export function formatShopifyQLTable(tableData) {
   const columns = tableData.columns || [];
   const rows = tableData.rows || [];
   const out = [];
@@ -213,7 +213,7 @@ function formatShopifyQLTable(tableData) {
   return out;
 }
 
-async function fetchShopifyQLHourlySessions(brand, targetYmd) {
+export async function fetchShopifyQLHourlySessions(brand, targetYmd) {
   const url = `https://${brand.shopName}.myshopify.com/admin/api/2025-10/graphql.json`;
   const q = buildShopifyQLHourlyQuery(targetYmd).replace(/"/g, '\\"');
 
@@ -248,7 +248,7 @@ async function fetchShopifyQLHourlySessions(brand, targetYmd) {
 }
 
 // ---------- MySQL upsert (always writes 24 rows/day) ----------
-async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
+export async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
   const conn = await brand.pool.getConnection();
   try {
     await conn.query(`DELETE FROM hourly_sessions_summary_shopify WHERE date = ?`, [targetYmd]);
@@ -286,7 +286,7 @@ async function upsertHourlySessionsSummary(brand, hourlyRows, targetYmd) {
 }
 
 // ---------- run ----------
-async function run() {
+export async function run() {
   if (!MODE) {
     console.log(`[HOURLY] HOURLY_BACKFILL_MODE is not true. Exiting.`);
     return;
