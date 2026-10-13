@@ -98,10 +98,22 @@ pipeline {
 
   post {
     always {
-      // Drop the build tag: on success products-pipeline:latest still points at
-      // the image; on failure it's the rejected image. :rollback is kept.
+      sh 'rm -f .env'
+    }
+    success {
+      // Keep this build's tag: the running containers were created from it, so
+      // `docker ps` shows products-pipeline:<build> instead of a bare image ID.
+      // Untag older build numbers (:latest / :rollback keep what they need).
       sh '''
-        rm -f .env
+        docker images products-pipeline --format '{{.Tag}}' \
+          | grep -E '^[0-9]+$' | grep -vx "$BUILD_NUMBER" \
+          | xargs -r -I{} docker rmi "products-pipeline:{}" >/dev/null 2>&1 || true
+        docker image prune -f >/dev/null 2>&1 || true
+      '''
+    }
+    unsuccessful {
+      // Rejected image: untag it (a no-op while a container still uses it).
+      sh '''
         docker rmi "$IMAGE" >/dev/null 2>&1 || true
         docker image prune -f >/dev/null 2>&1 || true
       '''
