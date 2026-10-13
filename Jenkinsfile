@@ -2,6 +2,7 @@
 //
 //   Build image  ->  Compile checks  ->  Unit tests  ->  Deploy (auto-rollback)
 //
+// Runs only on master (multibranch job); other branches skip every stage.
 // Any failure before Deploy stops the build with the running stack untouched.
 // Deploy ships the exact image that passed the checks (no rebuild), and
 // scripts/deploy.sh rolls back to the previous image automatically if the new
@@ -35,56 +36,61 @@ pipeline {
   }
 
   stages {
-    stage('Build image') {
-      steps {
-        sh 'docker build --pull -t "$IMAGE" .'
-      }
-    }
-
-    stage('Compile checks') {
-      steps {
-        sh '''
-          docker run --rm "$IMAGE" sh -ec '
-            for f in *.js test/*.js; do node --check "$f"; done
-            sh -n backfill-cron-entrypoint.sh
-            sh -n backfill-cron-run.sh
-            npm ls --omit=dev >/dev/null
-          '
-          bash -n scripts/deploy.sh
-        '''
-      }
-    }
-
-    stage('Unit tests') {
-      steps {
-        sh '''
-          rm -rf test-results && mkdir -p test-results
-          # No env_file / -e here on purpose: tests must not see production
-          # config (e.g. BACKFILL_BRAND_INDICES in .env changes test behaviour).
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$WORKSPACE/test-results:/results" \
-            "$IMAGE" \
-            sh -c 'node --test \
-              --test-reporter=spec --test-reporter-destination=stdout \
-              --test-reporter=junit --test-reporter-destination=/results/junit.xml \
-              test/*.test.js'
-        '''
-      }
-      post {
-        always {
-          junit allowEmptyResults: false, testResults: 'test-results/junit.xml'
+    stage('CI/CD') {
+      when { branch 'master' }
+      stages {
+        stage('Build image') {
+          steps {
+            sh 'docker build --pull -t "$IMAGE" .'
+          }
         }
-      }
-    }
 
-    stage('Deploy') {
-      steps {
-        withCredentials([file(credentialsId: 'products-pipeline-env', variable: 'PROD_ENV_FILE')]) {
-          sh '''
-            install -m 600 "$PROD_ENV_FILE" .env
-            bash scripts/deploy.sh "$IMAGE"
-          '''
+        stage('Compile checks') {
+          steps {
+            sh '''
+              docker run --rm "$IMAGE" sh -ec '
+                for f in *.js test/*.js; do node --check "$f"; done
+                sh -n backfill-cron-entrypoint.sh
+                sh -n backfill-cron-run.sh
+                npm ls --omit=dev >/dev/null
+              '
+              bash -n scripts/deploy.sh
+            '''
+          }
+        }
+
+        stage('Unit tests') {
+          steps {
+            sh '''
+              rm -rf test-results && mkdir -p test-results
+              # No env_file / -e here on purpose: tests must not see production
+              # config (e.g. BACKFILL_BRAND_INDICES in .env changes test behaviour).
+              docker run --rm \
+                --user "$(id -u):$(id -g)" \
+                -v "$WORKSPACE/test-results:/results" \
+                "$IMAGE" \
+                sh -c 'node --test \
+                  --test-reporter=spec --test-reporter-destination=stdout \
+                  --test-reporter=junit --test-reporter-destination=/results/junit.xml \
+                  test/*.test.js'
+            '''
+          }
+          post {
+            always {
+              junit allowEmptyResults: false, testResults: 'test-results/junit.xml'
+            }
+          }
+        }
+
+        stage('Deploy') {
+          steps {
+            withCredentials([file(credentialsId: 'products-pipeline-env', variable: 'PROD_ENV_FILE')]) {
+              sh '''
+                install -m 600 "$PROD_ENV_FILE" .env
+                bash scripts/deploy.sh "$IMAGE"
+              '''
+            }
+          }
         }
       }
     }
