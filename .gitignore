@@ -2,4 +2,6 @@
 venv
 _pycache
 .env.local
-node_modulestest-results
+node_modules
+test-results
+.idea/
