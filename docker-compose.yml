@@ -6,6 +6,10 @@ services:
 
     build: .
 
+    # Jenkins deploys the exact image it tested by setting PIPELINE_IMAGE
+    # (see scripts/deploy.sh). Manual runs fall back to the last good deploy.
+    image: ${PIPELINE_IMAGE:-products-pipeline:latest}
+
     container_name: products-pipeline-ec2
 
     restart: always
@@ -36,6 +40,8 @@ services:
   products-pipeline-backfill:
 
     build: .
+
+    image: ${PIPELINE_IMAGE:-products-pipeline:latest}
 
     container_name: products-pipeline-backfill
 
