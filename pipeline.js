@@ -896,6 +896,8 @@ export async function ensureTablesForBrand(brand) {
 
         sessions INT DEFAULT 0,
         sessions_with_cart_additions INT DEFAULT 0,
+        sessions_reached_checkout INT DEFAULT 0,
+        sessions_completed_checkout INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         landing_page_path_norm VARCHAR(500) GENERATED ALWAYS AS (${PATH_NORM_EXPR}) STORED,
@@ -933,6 +935,20 @@ export async function ensureTablesForBrand(brand) {
       `ALTER TABLE product_sessions_snapshot
          ADD COLUMN dim_hash BINARY(20)
            GENERATED ALWAYS AS (${DIM_HASH_EXPR}) STORED`,
+    );
+    await ensureColumn(
+      conn,
+      "product_sessions_snapshot",
+      "sessions_reached_checkout",
+      `ALTER TABLE product_sessions_snapshot
+         ADD COLUMN sessions_reached_checkout INT DEFAULT 0`,
+    );
+    await ensureColumn(
+      conn,
+      "product_sessions_snapshot",
+      "sessions_completed_checkout",
+      `ALTER TABLE product_sessions_snapshot
+         ADD COLUMN sessions_completed_checkout INT DEFAULT 0`,
     );
     await ensureIndex(
       conn,
@@ -1014,10 +1030,26 @@ export async function ensureTablesForBrand(brand) {
         sessions INT NOT NULL DEFAULT 0,
         sessions_with_cart_additions INT NOT NULL DEFAULT 0,
         add_to_cart_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
+        sessions_completed_checkout INT NOT NULL DEFAULT 0,
+        session_conversion_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
         PRIMARY KEY (date, landing_page_type, product_type),
         KEY idx_type (landing_page_type)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+    await ensureColumn(
+      conn,
+      "mv_product_sessions_by_type_daily",
+      "sessions_completed_checkout",
+      `ALTER TABLE mv_product_sessions_by_type_daily
+         ADD COLUMN sessions_completed_checkout INT NOT NULL DEFAULT 0`,
+    );
+    await ensureColumn(
+      conn,
+      "mv_product_sessions_by_type_daily",
+      "session_conversion_rate",
+      `ALTER TABLE mv_product_sessions_by_type_daily
+         ADD COLUMN session_conversion_rate DECIMAL(6,4) NOT NULL DEFAULT 0`,
+    );
 
     // Note: includes add_to_cart_rate_pct because your INSERT uses it
     await conn.query(`
@@ -1030,12 +1062,28 @@ export async function ensureTablesForBrand(brand) {
         add_to_cart_rate DECIMAL(6,4) NOT NULL DEFAULT 0,
         add_to_cart_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
         conversion_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
+        sessions_completed_checkout INT NOT NULL DEFAULT 0,
+        session_conversion_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
         PRIMARY KEY (date, landing_page_path(200)),
         KEY idx_date (date),
         KEY idx_sessions (date, sessions DESC),
         KEY idx_product_id (product_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+    await ensureColumn(
+      conn,
+      "mv_product_sessions_by_path_daily",
+      "sessions_completed_checkout",
+      `ALTER TABLE mv_product_sessions_by_path_daily
+         ADD COLUMN sessions_completed_checkout INT NOT NULL DEFAULT 0`,
+    );
+    await ensureColumn(
+      conn,
+      "mv_product_sessions_by_path_daily",
+      "session_conversion_rate_pct",
+      `ALTER TABLE mv_product_sessions_by_path_daily
+         ADD COLUMN session_conversion_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0`,
+    );
 
     await conn.query(`
       CREATE TABLE IF NOT EXISTS product_landing_mapping (
@@ -1389,7 +1437,9 @@ export function buildShopifyQLQuery(
         utm_term,
         referrer_name,
         sessions,
-        sessions_with_cart_additions
+        sessions_with_cart_additions,
+        sessions_that_reached_checkout,
+        sessions_that_completed_checkout
       WHERE landing_page_path IS NOT NULL
         AND human_or_bot_session IN ('human', 'bot')
       GROUP BY
@@ -2000,10 +2050,12 @@ export async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
       r.referrer_name || null,
       Number(r.sessions || 0),
       Number(r.sessions_with_cart_additions || 0),
+      Number(r.sessions_that_reached_checkout || 0),
+      Number(r.sessions_that_completed_checkout || 0),
     ]);
 
     const placeholders = insertRows
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .join(", ");
 
     await conn.query(
@@ -2021,12 +2073,16 @@ export async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
         utm_term,
         referrer_name,
         sessions,
-        sessions_with_cart_additions
+        sessions_with_cart_additions,
+        sessions_reached_checkout,
+        sessions_completed_checkout
       )
       VALUES ${placeholders}
       ON DUPLICATE KEY UPDATE
         sessions                     = VALUES(sessions),
         sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
+        sessions_reached_checkout    = VALUES(sessions_reached_checkout),
+        sessions_completed_checkout  = VALUES(sessions_completed_checkout),
         updated_at                   = CURRENT_TIMESTAMP
     `,
       insertRows.flat(),
@@ -2073,7 +2129,8 @@ export async function refreshMaterializedViews(brand, targetYmd) {
     await conn.query(
       `
       INSERT INTO mv_product_sessions_by_type_daily
-      (date, landing_page_type, product_type, sessions, sessions_with_cart_additions, add_to_cart_rate)
+      (date, landing_page_type, product_type, sessions, sessions_with_cart_additions, add_to_cart_rate,
+       sessions_completed_checkout, session_conversion_rate)
       SELECT
         s.date,
         s.landing_page_type,
@@ -2082,7 +2139,11 @@ export async function refreshMaterializedViews(brand, targetYmd) {
         SUM(s.sessions_with_cart_additions) AS sessions_with_cart_additions,
         CASE WHEN SUM(s.sessions) > 0
              THEN ROUND(SUM(s.sessions_with_cart_additions) / SUM(s.sessions), 4)
-             ELSE 0 END AS add_to_cart_rate
+             ELSE 0 END AS add_to_cart_rate,
+        SUM(s.sessions_completed_checkout) AS sessions_completed_checkout,
+        CASE WHEN SUM(s.sessions) > 0
+             THEN ROUND(SUM(s.sessions_completed_checkout) / SUM(s.sessions), 4)
+             ELSE 0 END AS session_conversion_rate
       FROM product_sessions_snapshot s
       LEFT JOIN product_landing_mapping m
         ON s.landing_page_path_norm = m.landing_page_path_norm
@@ -2091,7 +2152,9 @@ export async function refreshMaterializedViews(brand, targetYmd) {
       ON DUPLICATE KEY UPDATE
         sessions                     = VALUES(sessions),
         sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
-        add_to_cart_rate             = VALUES(add_to_cart_rate)
+        add_to_cart_rate             = VALUES(add_to_cart_rate),
+        sessions_completed_checkout  = VALUES(sessions_completed_checkout),
+        session_conversion_rate      = VALUES(session_conversion_rate)
     `,
       [targetYmd],
     );
@@ -2108,7 +2171,9 @@ export async function refreshMaterializedViews(brand, targetYmd) {
         sessions_with_cart_additions,
         add_to_cart_rate,
         add_to_cart_rate_pct,
-        conversion_rate_pct
+        conversion_rate_pct,
+        sessions_completed_checkout,
+        session_conversion_rate_pct
       )
       SELECT
         s.date,
@@ -2134,7 +2199,18 @@ export async function refreshMaterializedViews(brand, targetYmd) {
             -- Use MAX(o.orders) to strictly comply with only_full_group_by since o.orders is aggregate per product
             THEN ROUND(COALESCE(MAX(o.orders), 0) / SUM(s.sessions) * 100, 4)
           ELSE 0
-        END AS conversion_rate_pct
+        END AS conversion_rate_pct,
+
+        SUM(s.sessions_completed_checkout) AS sessions_completed_checkout,
+
+        -- Session-attributed CVR (completed-checkout sessions / sessions). Unlike
+        -- conversion_rate_pct above it needs no product mapping, so it is also
+        -- populated for collection / homepage / other landing paths.
+        CASE
+          WHEN SUM(s.sessions) > 0
+            THEN ROUND(SUM(s.sessions_completed_checkout) / SUM(s.sessions) * 100, 4)
+          ELSE 0
+        END AS session_conversion_rate_pct
 
       FROM product_sessions_snapshot s
 
@@ -2165,7 +2241,9 @@ export async function refreshMaterializedViews(brand, targetYmd) {
         sessions_with_cart_additions = VALUES(sessions_with_cart_additions),
         add_to_cart_rate             = VALUES(add_to_cart_rate),
         add_to_cart_rate_pct         = VALUES(add_to_cart_rate_pct),
-        conversion_rate_pct          = VALUES(conversion_rate_pct)
+        conversion_rate_pct          = VALUES(conversion_rate_pct),
+        sessions_completed_checkout  = VALUES(sessions_completed_checkout),
+        session_conversion_rate_pct  = VALUES(session_conversion_rate_pct)
     `,
       [targetYmd, targetYmd],
     );

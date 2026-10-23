@@ -169,6 +169,8 @@ describe("upsertProductSessionsSnapshot", () => {
           utm_source: "google",
           sessions: "12",
           sessions_with_cart_additions: "3",
+          sessions_that_reached_checkout: "2",
+          sessions_that_completed_checkout: "1",
         },
         { landing_page_path: "/" },
       ],
@@ -179,8 +181,8 @@ describe("upsertProductSessionsSnapshot", () => {
     assert.match(now.sql, /SELECT NOW\(\)/);
     assert.match(insert.sql, /INSERT INTO product_sessions_snapshot/);
     assert.deepEqual(insert.params, [
-      DAY, "Product", "/products/a", null, "google", null, null, null, null, null, 12, 3,
-      DAY, "Unknown", "/", null, null, null, null, null, null, null, 0, 0,
+      DAY, "Product", "/products/a", null, "google", null, null, null, null, null, 12, 3, 2, 1,
+      DAY, "Unknown", "/", null, null, null, null, null, null, null, 0, 0, 0, 0,
     ]);
     assert.match(update.sql, /UPDATE product_sessions_snapshot s\s+JOIN product_landing_mapping/);
     assert.deepEqual(update.params, [DAY]);

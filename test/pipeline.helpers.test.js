@@ -340,6 +340,12 @@ describe("ShopifyQL query builders", () => {
     assert.match(q, /ORDER BY sessions DESC,\s+landing_page_type ASC/);
   });
 
+  test("buildShopifyQLQuery: requests checkout-funnel metrics for session CVR", () => {
+    const q = p.buildShopifyQLQuery(brand, PAST_DAY);
+    assert.match(q, /sessions_that_reached_checkout/);
+    assert.match(q, /sessions_that_completed_checkout/);
+  });
+
   test("buildShopifyQLQuery: custom limit/offset and DURING today for null date", () => {
     const q = p.buildShopifyQLQuery(brand, null, { limit: 50, offset: 100 });
     assert.match(q, /LIMIT 50 OFFSET 100/);
