@@ -21,6 +21,17 @@ services:
       - ./logs:/app/logs
 
     command: node pipeline.js
+    # Resource isolation for the shared 4 GiB host: no swap spill (memswap_limit == mem_limit),
+    # a CPU ceiling and a PID cap. (Node: V8's heap limit is derived from the cgroup limit.)
+    mem_limit: ${PRODUCTS_PIPELINE_MEM_LIMIT:-768m}
+    memswap_limit: ${PRODUCTS_PIPELINE_MEM_LIMIT:-768m}
+    cpus: ${PRODUCTS_PIPELINE_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
     networks:
       - pipeline-net
@@ -65,6 +76,15 @@ services:
       - ./logs:/app/logs
 
     entrypoint: ["sh", "/app/backfill-cron-entrypoint.sh"]
+    mem_limit: ${PRODUCTS_BACKFILL_MEM_LIMIT:-768m}
+    memswap_limit: ${PRODUCTS_BACKFILL_MEM_LIMIT:-768m}
+    cpus: ${PRODUCTS_BACKFILL_CPUS:-1.0}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
     networks:
       - pipeline-net
