@@ -75,6 +75,7 @@ describe("ensureTablesForBrand", () => {
       "mv_product_sessions_by_path_daily",
       "product_landing_mapping",
       "mv_product_sessions_by_campaign_daily",
+      "mv_collection_sessions_by_path_daily",
       "pipeline_metadata",
       "hourly_sessions_summary_shopify",
       "hourly_product_sessions",
@@ -193,16 +194,19 @@ describe("upsertProductSessionsSnapshot", () => {
 });
 
 describe("refreshMaterializedViews", () => {
-  test("upserts the type, path and campaign MVs for the date", async () => {
+  test("upserts the type, path, campaign and collection MVs for the date", async () => {
     const brand = makeBrand();
     await p.refreshMaterializedViews(brand, DAY);
-    const [type, path, campaign] = brand.pool.calls;
+    const [type, path, campaign, collection] = brand.pool.calls;
     assert.match(type.sql, /INSERT INTO mv_product_sessions_by_type_daily/);
     assert.deepEqual(type.params, [DAY]);
     assert.match(path.sql, /INSERT INTO mv_product_sessions_by_path_daily/);
     assert.deepEqual(path.params, [DAY, DAY]);
     assert.match(campaign.sql, /INSERT INTO mv_product_sessions_by_campaign_daily/);
     assert.deepEqual(campaign.params, [DAY, DAY]);
+    assert.match(collection.sql, /INSERT INTO mv_collection_sessions_by_path_daily/);
+    assert.deepEqual(collection.params, [DAY, DAY]);
+    assert.equal(brand.pool.calls.length, 4);
     assert.equal(brand.pool.released, 1);
   });
 

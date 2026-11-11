@@ -1151,6 +1151,21 @@ export async function ensureTablesForBrand(brand) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
+    // Collection/PLP CVR (V1): one row per brand-local day per exact
+    // /collections/<handle> landing path. Percent, 4dp, like the
+    // mv_product_sessions_by_path_daily conversion_rate_pct.
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS mv_collection_sessions_by_path_daily (
+        date DATE NOT NULL,
+        collection_path VARCHAR(500) NOT NULL,
+        sessions INT NOT NULL DEFAULT 0,
+        orders INT NOT NULL DEFAULT 0,
+        conversion_rate_pct DECIMAL(7,4) NOT NULL DEFAULT 0,
+        PRIMARY KEY (date, collection_path(200)),
+        KEY idx_date (date)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
     await conn.query(`
       CREATE TABLE IF NOT EXISTS pipeline_metadata (
         key_name VARCHAR(100) PRIMARY KEY,
@@ -2117,6 +2132,61 @@ export async function upsertProductSessionsSnapshot(brand, rows, targetYmd) {
   }
 }
 
+// A collection landing is EXACTLY /collections/<handle> (one non-empty segment).
+// /collections/<h>/products/<p>, /products/<p>, /, /cart, /collections/ are not.
+export const COLLECTION_PATH_REGEX = "^/collections/[^/]+$";
+
+// Collection/PLP CVR for one brand-local day (params: [date, date]):
+//   sessions = SUM(sessions) of the Collection-landing snapshot rows, grouped by
+//              (date, path) only - the snapshot's UTM / referrer rows collapse
+//              into one total per collection;
+//   orders   = COUNT(DISTINCT order_id) whose normalized landing path
+//              (shopify_orders.landing_page_path: landing_site, else full_url)
+//              is that exact collection path - never COUNT(*) of line items.
+// Same date columns as the PDP path MV (snapshot date / created_dt, both the
+// brand-local day). V1 attribution model, not session-level ground truth.
+export const COLLECTION_MV_UPSERT_SQL = `
+      INSERT INTO mv_collection_sessions_by_path_daily
+      (date, collection_path, sessions, orders, conversion_rate_pct)
+      SELECT
+        s.date,
+        s.collection_path,
+        s.sessions,
+        COALESCE(o.orders, 0) AS orders,
+        CASE
+          WHEN s.sessions > 0
+            THEN ROUND(COALESCE(o.orders, 0) / s.sessions * 100, 4)
+          ELSE 0
+        END AS conversion_rate_pct
+      FROM (
+        SELECT
+          date,
+          LOWER(landing_page_path_norm) AS collection_path,
+          SUM(sessions) AS sessions
+        FROM product_sessions_snapshot
+        WHERE date = ?
+          AND landing_page_type = 'Collection'
+          AND LOWER(landing_page_path_norm) REGEXP '${COLLECTION_PATH_REGEX}'
+        GROUP BY date, LOWER(landing_page_path_norm)
+      ) s
+      LEFT JOIN (
+        SELECT
+          created_dt AS created_date,
+          landing_page_path AS collection_path,
+          COUNT(DISTINCT order_id) AS orders
+        FROM shopify_orders
+        WHERE created_dt = ?
+          AND landing_page_path REGEXP '${COLLECTION_PATH_REGEX}'
+        GROUP BY created_dt, landing_page_path
+      ) o
+        ON o.collection_path = s.collection_path
+       AND o.created_date    = s.date
+      ON DUPLICATE KEY UPDATE
+        sessions            = VALUES(sessions),
+        orders              = VALUES(orders),
+        conversion_rate_pct = VALUES(conversion_rate_pct)
+    `;
+
 export async function refreshMaterializedViews(brand, targetYmd) {
   const conn = await brand.pool.getConnection();
 
@@ -2321,6 +2391,18 @@ export async function refreshMaterializedViews(brand, targetYmd) {
     `,
       [targetYmd, targetYmd],
     );
+
+    // ---------- COLLECTION MV ----------
+    // Isolated on purpose: it reads shopify_orders.landing_page_path, which a
+    // brand only has once the orders pipeline's schema upgrade has run. A
+    // failure here must never fail the PDP views refreshed above.
+    try {
+      await conn.query(COLLECTION_MV_UPSERT_SQL, [targetYmd, targetYmd]);
+    } catch (err) {
+      console.warn(
+        `[${brand.name}] Collection MV refresh skipped for ${targetYmd}: ${err.message}`,
+      );
+    }
 
     console.log(
       `[${brand.name}] Refreshed MVs for ${targetYmd} (upserted).`,
